@@ -885,6 +885,7 @@ def run_backtest(store: Store, rules_path, config: Config) -> dict:
 
     pairs: dict[str, list[tuple[Decimal, Decimal]]] = {r.id: [] for r in rules}
     seen_months: set[tuple[int, int]] = set()
+    window_count = 0
     for b in bars:
         key = (b.date.year, b.date.month)
         if key in seen_months:
@@ -895,10 +896,11 @@ def run_backtest(store: Store, rules_path, config: Config) -> dict:
             continue
         window = [x for x in bars if b.date <= x.date <= bound]
         res = simulate(window, rules, settings, fx)
+        window_count += 1
         base = res.metrics["baseline"].final_shares
         for r in rules:
             pairs[r.id].append((res.metrics[r.id].final_shares, base))
-    if not any(pairs.values()) and rules:
+    if window_count == 0:
         raise ConfigError("no complete rolling windows")
 
     rolling = {}
