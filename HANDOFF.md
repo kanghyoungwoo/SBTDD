@@ -75,6 +75,14 @@ python3 -B -m harness --root "$PWD/projects/qqq-accumulator" run
   3. 정적 타입: `harness/`와 `tools/` 전체에 타입 힌트를 달고 mypy `--strict`가 Linux·Windows·macOS
      분기에서 모두 통과한다(pyright도 0건). mypy가 없는 PC에서도 `run`이 통과하도록 `harness.json` 검사에는
      넣지 않고, GitHub Actions(`.github/workflows/ci.yml`)가 3개 OS × Python 3.11·3.13 테스트와 타입 검사를 돌린다.
+- 첫 CI 실행에서 처음으로 실제 macOS·Windows에서 테스트가 돌았고 다음을 고쳤다.
+  - macOS 실제 버그: 증거 쓰기는 경로의 심볼릭 링크를 모두 거부하는데, AI 호출 자료를 받는 임시 폴더가
+    macOS의 `/var`(→ `/private/var`) 아래라 agent·init이 첫 AI 호출에서 `input_error`로 멈췄다. 임시 폴더와
+    root를 실제 경로로 바꿔 쓰도록 고쳤다(가짜 Codex로 CLI에서 재현 후 확인, 회귀 테스트 SCN-GUARD-TMP-LINK).
+  - 테스트 경로: macOS 링크와 Windows 8.3 짧은 이름(`RUNNER~1`) 때문에 임시 경로를 정규화했다.
+  - Windows 스냅샷 테스트: 파일 시각이 약 16 ms 단위로 바뀌어, 시간을 흉내만 낸 테스트가 같은 시각을 봤다.
+    파일 시각을 실제로 한 시간 전으로 돌린 뒤 재사용과 변경 감지를 확인하도록 고쳤다(제품 동작은 2초 안정 구간으로 이미 안전).
+  - Windows 잠금(`msvcrt`)·프로세스 트리 종료 테스트는 실제 Windows에서 처음 실행해 모두 통과했다.
 
 ### 3.2 QQQ 장기 적립 프로그램 (`projects/qqq-accumulator/`)
 

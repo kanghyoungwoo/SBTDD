@@ -519,8 +519,13 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.hash_count()[0], 1)
 
     def test_same_size_rewrite_is_detected_after_reuse(self):
+        # Age the file for real: Windows file times advance in clock ticks (about 16 ms), so a rewrite
+        # right after setUp could keep the same time. A file outside the settle window cannot.
+        hour_ago = time.time_ns() - 3_600_000_000_000
+        os.utime(self.file, ns=(hour_ago, hour_ago))
         with self.settled():
             before = guard.tree_snapshot(self.root)
+            self.assertEqual(self.hash_count()[0], 0)  # the digest is reused from here on
         self.file.write_text('bbbb', encoding='utf-8')
         self.assertEqual(guard.changed_paths(before, guard.tree_snapshot(self.root)), ['data.txt'])
 
