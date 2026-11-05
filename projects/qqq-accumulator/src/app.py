@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import zoneinfo
 from pathlib import Path
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable
 
 from .models import (
@@ -125,6 +125,36 @@ def main(
                                   "reasons": res.reasons,
                                   "orders_sent": res.orders_sent}) + "\n")
             return res.exit_code
+        finally:
+            if store is not None:
+                store.close()
+
+    if args.command == "adjust":
+        store = None
+        try:
+            config = load_config(args.config)
+            db = _cfg_get(config.raw, "paths.database")
+            if not isinstance(db, str) or not db:
+                raise ConfigError("paths.database is required")
+            if args.shares is None or args.reason is None:
+                err.write("error: --shares and --reason are required\n")
+                return 2
+            try:
+                shares = Decimal(args.shares)
+            except InvalidOperation:
+                err.write("error: invalid --shares\n")
+                return 2
+            if not shares.is_finite():
+                err.write("error: invalid --shares\n")
+                return 2
+            store = Store.open(db)
+            record_adjustment(store, shares, args.reason)
+            out.write(json.dumps({"adjusted": str(shares)}) + "\n")
+            return 0
+        except (ConfigError, ValueError, OSError, RuntimeError,
+                sqlite3.Error) as exc:
+            err.write(f"error: {exc}\n")
+            return 2
         finally:
             if store is not None:
                 store.close()
@@ -344,6 +374,15 @@ class Store:
             reason TEXT NOT NULL,
             UNIQUE (trade_date, kind, reason)
         ) STRICT""",
+        """CREATE TABLE IF NOT EXISTS split_applications (
+            bar_date TEXT PRIMARY KEY,
+            factor TEXT NOT NULL,
+            applied_at TEXT
+        ) STRICT""",
+        """CREATE TABLE IF NOT EXISTS halts (
+            reason TEXT PRIMARY KEY,
+            created_at TEXT
+        ) STRICT""",
         """CREATE TABLE IF NOT EXISTS run_log (
             id INTEGER PRIMARY KEY,
             at TEXT NOT NULL,
@@ -434,6 +473,42 @@ class Store:
             else:
                 total = total + a
         return total
+
+    def _apply_pending_splits(self, upto: dt.date) -> None:
+        conn = self._conn
+        rows = conn.execute(
+            "SELECT date, split_factor FROM bars WHERE date <= ?"
+            " AND date NOT IN (SELECT bar_date FROM split_applications)"
+            " ORDER BY date", (upto.isoformat(),)).fetchall()
+        rows = [r for r in rows if Decimal(r[1]) != 1]
+        if not rows:
+            return
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for d, factor in rows:
+                conn.execute(
+                    "INSERT INTO position_ledger (kind, amount, note,"
+                    " created_at) VALUES ('SPLIT', ?, ?, ?)", (factor, d, now))
+                conn.execute(
+                    "INSERT INTO split_applications (bar_date, factor,"
+                    " applied_at) VALUES (?, ?, ?)", (d, factor, now))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _set_halt(self, reason: str) -> None:
+        self._conn.execute(
+            "INSERT OR IGNORE INTO halts (reason, created_at) VALUES (?, ?)",
+            (reason, dt.datetime.now(dt.timezone.utc).isoformat()))
+
+    def _clear_halt(self, reason: str) -> None:
+        self._conn.execute("DELETE FROM halts WHERE reason = ?", (reason,))
+
+    def _active_halts(self) -> list[str]:
+        return [r[0] for r in self._conn.execute(
+            "SELECT reason FROM halts ORDER BY reason").fetchall()]
 
     # -- internal helpers used by run_once --------------------------------
     def _orders_raw(self) -> list[dict]:
@@ -1231,12 +1306,19 @@ def _run_once_body(config, store, broker, notifier, now, tz, ny_date):
     if broker is None:
         return finish(2, "NO_BROKER_ADAPTER")
 
+    prior = store._conn.execute(
+        "SELECT MAX(date) FROM bars WHERE date < ?",
+        (ny_date.isoformat(),)).fetchone()[0]
+    if prior is not None:
+        store._apply_pending_splits(dt.date.fromisoformat(prior))
     try:
         _reconcile(store, broker, config, now, tz)
         position = broker.get_position("QQQ")
     except BrokerError:
         return finish(2, "BROKER_ERROR")
     if position != store.holdings():
+        store._set_halt("POSITION_MISMATCH")
+    if "POSITION_MISMATCH" in store._active_halts():
         return finish(1, "POSITION_MISMATCH")
     if any(o["status"] in ("SENDING", "UNKNOWN") for o in store._orders_raw()):
         return finish(1, "UNRESOLVED_ORDER")
@@ -1378,7 +1460,26 @@ def get_status(store: Store) -> dict:
 
 
 def record_adjustment(store: Store, shares: Decimal, reason: str) -> None:
-    raise NotImplementedError("record_adjustment")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason is required")
+    try:
+        amount = Decimal(shares)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("shares must be a number") from exc
+    if not amount.is_finite():
+        raise ValueError("shares must be finite")
+    conn = store._conn
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT INTO position_ledger (kind, amount, note, created_at)"
+            " VALUES ('ADJUST', ?, ?, ?)",
+            (str(amount), reason, dt.datetime.now(dt.timezone.utc).isoformat()))
+        conn.execute("DELETE FROM halts WHERE reason = 'POSITION_MISMATCH'")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 class FakeBroker:
