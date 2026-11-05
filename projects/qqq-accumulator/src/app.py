@@ -1166,9 +1166,11 @@ def _reconcile(store: Store, broker, config: Config, now, tz) -> None:
         if match is not None:
             linked.add(match.broker_order_id)
         if match is None:
+            if o["status"] not in ("SENDING", "UNKNOWN"):
+                continue
             if o["status"] == "SENDING":
                 store._set_order_status(o["id"], "UNKNOWN")
-            row = store._conn.execute(
+            row =store._conn.execute(
                 "SELECT close_time FROM calendar WHERE date = ?", (td,)).fetchone()
             if row is not None and row[0]:
                 close_t = dt.datetime.strptime(row[0], "%H:%M").time()
