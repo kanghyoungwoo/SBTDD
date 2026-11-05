@@ -72,8 +72,16 @@ class LockTests(unittest.TestCase):
                 pass
         self.assertEqual(error.exception.owner["command"], "holder")
         stop()
-        with project_lock(self.root, "run") as token:
-            self.assertTrue(token)
+        deadline = time.monotonic() + 5  # Windows may release a dead process's locks a moment later.
+        while True:
+            try:
+                with project_lock(self.root, "run") as token:
+                    self.assertTrue(token)
+                break
+            except ProjectLocked:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
 
     def test_agent_and_init_write_nothing_while_locked(self):
         hold_lock(self, self.root)
