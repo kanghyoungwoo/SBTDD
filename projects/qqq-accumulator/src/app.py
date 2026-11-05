@@ -330,6 +330,26 @@ class Store:
             rows INTEGER NOT NULL,
             imported_at TEXT NOT NULL
         ) STRICT""",
+        """CREATE TABLE IF NOT EXISTS position_ledger (
+            id INTEGER PRIMARY KEY,
+            kind TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            order_id INTEGER UNIQUE,
+            note TEXT,
+            created_at TEXT
+        ) STRICT""",
+        """CREATE TABLE IF NOT EXISTS notifications_sent (
+            trade_date TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            UNIQUE (trade_date, kind, reason)
+        ) STRICT""",
+        """CREATE TABLE IF NOT EXISTS run_log (
+            id INTEGER PRIMARY KEY,
+            at TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            reasons TEXT NOT NULL
+        ) STRICT""",
     )
 
     def __init__(self, path, conn: sqlite3.Connection | None = None) -> None:
@@ -404,7 +424,76 @@ class Store:
         ]
 
     def holdings(self) -> Decimal:
-        raise NotImplementedError("Store.holdings")
+        total = Decimal(0)
+        rows = self._conn.execute(
+            "SELECT kind, amount FROM position_ledger ORDER BY id").fetchall()
+        for kind, amount in rows:
+            a = Decimal(amount)
+            if kind == "SPLIT":
+                total = total * a
+            else:
+                total = total + a
+        return total
+
+    # -- internal helpers used by run_once --------------------------------
+    def _orders_raw(self) -> list[dict]:
+        cols = ("id", "trade_date", "rule_id", "status", "quantity",
+                "limit_price", "client_order_id", "broker_order_id",
+                "fill_price", "fill_cost")
+        rows = self._conn.execute(
+            "SELECT " + ", ".join(cols) + " FROM orders ORDER BY id"
+        ).fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    def _set_order_status(self, order_id: int, status: str,
+                          broker_order_id: str | None = None) -> None:
+        if broker_order_id is None:
+            self._conn.execute("UPDATE orders SET status = ? WHERE id = ?",
+                               (status, order_id))
+        else:
+            self._conn.execute(
+                "UPDATE orders SET status = ?, broker_order_id = ?"
+                " WHERE id = ?", (status, broker_order_id, order_id))
+
+    def _set_client_order_id(self, order_id: int, client_order_id: str) -> None:
+        self._conn.execute(
+            "UPDATE orders SET client_order_id = ? WHERE id = ?",
+            (client_order_id, order_id))
+
+    def _mark_filled(self, order_id: int, quantity: Decimal,
+                     fill_price: Decimal, fill_cost: Decimal,
+                     broker_order_id: str | None) -> None:
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE orders SET status = 'FILLED', fill_price = ?,"
+                " fill_cost = ?, broker_order_id = COALESCE(?, broker_order_id)"
+                " WHERE id = ? AND status != 'FILLED'",
+                (str(fill_price), str(fill_cost), broker_order_id, order_id))
+            if cur.rowcount:
+                conn.execute(
+                    "INSERT OR IGNORE INTO position_ledger (kind, amount,"
+                    " order_id, created_at) VALUES ('FILL', ?, ?, ?)",
+                    (str(quantity), order_id,
+                     dt.datetime.now(dt.timezone.utc).isoformat()))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _first_notification(self, trade_date: dt.date, kind: str,
+                            reason: str) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO notifications_sent (trade_date, kind,"
+            " reason) VALUES (?, ?, ?)", (trade_date.isoformat(), kind, reason))
+        return cur.rowcount > 0
+
+    def _log_run(self, at: dt.datetime, exit_code: int,
+                 reasons: list[str]) -> None:
+        self._conn.execute(
+            "INSERT INTO run_log (at, exit_code, reasons) VALUES (?, ?, ?)",
+            (at.isoformat(), exit_code, ",".join(reasons)))
 
     def list_bars(self) -> list[Bar]:
         """Stored daily bars in date order (query helper)."""
@@ -589,6 +678,20 @@ def import_csv(store: Store, path) -> ImportResult:
     return ImportResult(kind=kind, rows=len(out), sha256=digest)
 
 
+def _decide_amount(rule: Rule, bar: Bar, available: Decimal,
+                   is_deposit: bool) -> Decimal:
+    """Shared decision function for backtest and live runs."""
+    zero = Decimal(0)
+    if rule.type == "baseline":
+        return available if is_deposit else zero
+    if rule.type == "close_at_or_below":
+        if (rule.threshold_usd is not None and bar.close <=
+                rule.threshold_usd and available > 0):
+            return available
+        return zero
+    raise ValueError(f"unknown rule type: {rule.type}")
+
+
 def simulate(
     bars: list[Bar],
     rules: list[Rule],
@@ -635,15 +738,7 @@ def simulate(
         if r.type not in ("baseline", "close_at_or_below"):
             raise ValueError(f"unknown rule type: {r.type}")
 
-    def decide(rule: Rule, bar: Bar, available: Decimal, is_deposit: bool):
-        if rule.type == "baseline":
-            return available if is_deposit else zero
-        if rule.type == "close_at_or_below":
-            if (rule.threshold_usd is not None and bar.close <=
-                    rule.threshold_usd and available > 0):
-                return available
-            return zero
-        raise ValueError(f"unknown rule type: {rule.type}")
+    decide = _decide_amount
 
     states = {}
     for r in all_rules:
@@ -997,7 +1092,16 @@ def is_in_order_window(
     close_time: dt.time,
     tz_loader: Callable[[str], dt.tzinfo] = zoneinfo.ZoneInfo,
 ) -> bool:
-    raise NotImplementedError("is_in_order_window")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    local = now.astimezone(tz_loader("America/New_York"))
+    base = dt.date(2000, 1, 1)
+    shift = (dt.datetime.combine(base, dt.time(16, 0))
+             - dt.datetime.combine(base, close_time))
+    start = dt.datetime.combine(base, window_start) - shift
+    end = dt.datetime.combine(base, window_end) - shift
+    t = dt.datetime.combine(base, local.time().replace(tzinfo=None))
+    return start <= t <= end
 
 
 def run_once(
@@ -1025,7 +1129,222 @@ def run_once(
             kind="ERROR", trade_date=ny_date, reason="CONFIG_ERROR",
             text=str(exc)))
         return RunResult(exit_code=2, reasons=["CONFIG_ERROR"], orders_sent=0)
-    raise NotImplementedError("run_once")
+    return _run_once_body(config, store, broker, notifier, now, tz, ny_date)
+
+
+def _q(value: Decimal, exp: str, mode) -> Decimal:
+    return value.quantize(Decimal(exp), rounding=mode)
+
+
+def _reconcile(store: Store, broker, config: Config) -> None:
+    from decimal import ROUND_CEILING, ROUND_HALF_UP
+
+    fee_pct = _cfg_num(config.raw, "costs.buy_fee_pct")
+    pending = [o for o in store._orders_raw()
+               if o["status"] in ("SENT", "SENDING", "UNKNOWN")]
+    cache: dict[str, list[BrokerOrder]] = {}
+    for o in pending:
+        td = o["trade_date"]
+        if td not in cache:
+            cache[td] = list(broker.list_orders(dt.date.fromisoformat(td)))
+        match = None
+        for b in cache[td]:
+            if o["client_order_id"] and b.client_order_id == o["client_order_id"]:
+                match = b
+                break
+        if match is None:
+            continue
+        if match.status == "OPEN":
+            if o["status"] != "SENT":
+                store._set_order_status(o["id"], "SENT", match.broker_order_id)
+        elif match.status == "FILLED" and match.fill_price is not None:
+            qty = Decimal(o["quantity"])
+            cost = _q(qty * match.fill_price, "0.01", ROUND_HALF_UP)
+            fee = _q(cost * fee_pct / Decimal(100), "0.01", ROUND_CEILING)
+            store._mark_filled(o["id"], qty, match.fill_price, cost + fee,
+                               match.broker_order_id)
+        elif match.status == "UNFILLED":
+            store._set_order_status(o["id"], "UNFILLED", match.broker_order_id)
+        elif match.status == "REJECTED":
+            store._set_order_status(o["id"], "REJECTED", match.broker_order_id)
+
+
+def _run_once_body(config, store, broker, notifier, now, tz, ny_date):
+    from decimal import ROUND_CEILING  # noqa: F401
+
+    raw = config.raw
+    reasons: list[str] = []
+    state = {"sent": 0}
+
+    def finish(code: int, reason: str | None = None) -> RunResult:
+        if reason is not None:
+            reasons.append(reason)
+        if code == 1 and reasons:
+            r = reasons[-1]
+            if store._first_notification(ny_date, "SAFETY", r):
+                _safe_send(notifier, Notification(
+                    kind="SAFETY", trade_date=ny_date, reason=r, text=r))
+        elif code == 2 and reasons:
+            r = reasons[-1]
+            _safe_send(notifier, Notification(
+                kind="ERROR", trade_date=ny_date, reason=r, text=r))
+        try:
+            store._log_run(now, code, reasons)
+        except sqlite3.Error:
+            pass
+        return RunResult(exit_code=code, reasons=list(reasons),
+                         orders_sent=state["sent"])
+
+    def warn(reason: str) -> None:
+        if store._first_notification(ny_date, "WARNING", reason):
+            _safe_send(notifier, Notification(
+                kind="WARNING", trade_date=ny_date, reason=reason, text=reason))
+
+    if config.stage == "live":
+        return finish(2, "STAGE_NOT_SUPPORTED")
+    if broker is None:
+        return finish(2, "NO_BROKER_ADAPTER")
+
+    try:
+        _reconcile(store, broker, config)
+        position = broker.get_position("QQQ")
+    except BrokerError:
+        return finish(2, "BROKER_ERROR")
+    if position != store.holdings():
+        return finish(1, "POSITION_MISMATCH")
+    if any(o["status"] in ("SENDING", "UNKNOWN") for o in store._orders_raw()):
+        return finish(1, "UNRESOLVED_ORDER")
+    if Path(_cfg_get(raw, "paths.halt_file")).exists():
+        return finish(1, "HALT_FILE")
+
+    conn = store._conn
+    row = conn.execute("SELECT is_open, close_time FROM calendar WHERE date = ?",
+                       (ny_date.isoformat(),)).fetchone()
+    if row is None:
+        return finish(1, "CALENDAR_MISSING")
+    if not row[0]:
+        return finish(0, "MARKET_CLOSED")
+    close_time = dt.datetime.strptime(row[1], "%H:%M").time()
+    if not is_in_order_window(
+            now, _cfg_hhmm(raw, "order_window.start"),
+            _cfg_hhmm(raw, "order_window.end"), close_time,
+            tz_loader=lambda _name: tz):
+        return finish(0, "OUTSIDE_WINDOW")
+
+    if "operating_rule" in raw and \
+            _cfg_get(raw, "operating_rule.type") == "close_at_or_below":
+        threshold = _cfg_num(raw, "operating_rule.threshold_usd")
+        rule = Rule(f"le{threshold.normalize():f}", "close_at_or_below",
+                    threshold)
+    else:
+        rule = Rule("baseline", "baseline")
+
+    orders = store._orders_raw()
+    if any(o["trade_date"] == ny_date.isoformat() and o["rule_id"] == rule.id
+           for o in orders):
+        return finish(0, "ALREADY_ORDERED")
+
+    bars = [b for b in store.list_bars() if b.date < ny_date]
+    prev_row = conn.execute(
+        "SELECT MAX(date) FROM calendar WHERE is_open = 1 AND date < ?",
+        (ny_date.isoformat(),)).fetchone()
+    if not bars or prev_row[0] is None or \
+            bars[-1].date != dt.date.fromisoformat(prev_row[0]):
+        return finish(1, "STALE_BAR")
+    bar = bars[-1]
+    if len(bars) >= 2:
+        prev_close = bars[-2].close / bar.split_factor
+        change = abs(bar.close - prev_close) / prev_close * Decimal(100)
+        if change > _cfg_num(raw, "guard.abnormal_price_pct"):
+            return finish(1, "ABNORMAL_PRICE")
+
+    try:
+        cash = broker.get_orderable_cash_usd()
+    except BrokerError:
+        return finish(2, "BROKER_ERROR")
+
+    if rule.type == "baseline":
+        is_deposit = _is_deposit_day(conn, raw, ny_date)
+    else:
+        is_deposit = False
+    amount = _decide_amount(rule, bar, cash, is_deposit)
+    if amount <= 0:
+        return finish(0, "NO_SIGNAL")
+
+    month_prefix = ny_date.strftime("%Y-%m-")
+    used = Decimal(0)
+    for o in orders:
+        if not o["trade_date"].startswith(month_prefix):
+            continue
+        if o["status"] == "FILLED" and o["fill_cost"] is not None:
+            used += Decimal(o["fill_cost"])
+        elif o["status"] in ("SENDING", "SENT", "UNKNOWN"):
+            used += Decimal(o["quantity"]) * Decimal(o["limit_price"])
+    monthly_remaining = _cfg_num(raw, "limits.monthly_usd") - used
+
+    plan = compute_order(
+        bar.close, _cfg_num(raw, "order.limit_margin_pct"), amount, cash,
+        _cfg_num(raw, "limits.per_order_usd"), monthly_remaining,
+        _cfg_num(raw, "costs.buy_fee_pct"), _cfg_bool(raw, "shares.fractional"))
+    if plan.quantity <= 0:
+        if plan.reason == "MONTHLY_LIMIT_REACHED":
+            return finish(1, "MONTHLY_LIMIT_REACHED")
+        warn("INSUFFICIENT_CASH")
+        return finish(0, "INSUFFICIENT_CASH")
+    if plan.binding == "PER_ORDER_LIMIT":
+        reasons.append("PER_ORDER_LIMIT_APPLIED")
+        warn("PER_ORDER_LIMIT_APPLIED")
+
+    if config.stage == "dry-run":
+        store.insert_order_intent(ny_date, rule.id, plan.quantity,
+                                  plan.limit_price, "DRY_RUN")
+        return finish(0, "DRY_RUN_RECORDED")
+
+    client_id = f"{ny_date.isoformat()}-{rule.id}"
+    try:
+        order_id = store.insert_order_intent(
+            ny_date, rule.id, plan.quantity, plan.limit_price, "SENDING")
+    except DuplicateOrderError:
+        return finish(0, "ALREADY_ORDERED")
+    store._set_client_order_id(order_id, client_id)
+    try:
+        broker_id = broker.place_loc_buy(OrderRequest(
+            client_id, "QQQ", ny_date, plan.quantity, plan.limit_price))
+    except BrokerTimeout:
+        return finish(2, "BROKER_TIMEOUT")
+    except BrokerRejected:
+        store._set_order_status(order_id, "REJECTED")
+        return finish(2, "BROKER_ERROR")
+    except BrokerError:
+        return finish(2, "BROKER_ERROR")
+    store._set_order_status(order_id, "SENT", broker_id)
+    state["sent"] = 1
+    return finish(0, "ORDER_SENT")
+
+
+def _is_deposit_day(conn, raw, d: dt.date) -> bool:
+    cycle = _cfg_get(raw, "deposit.cycle")
+    days = [dt.date.fromisoformat(r[0]) for r in conn.execute(
+        "SELECT date FROM calendar WHERE is_open = 1 ORDER BY date")]
+    if d not in days:
+        return False
+    if cycle == "monthly":
+        dd = _cfg_get(raw, "deposit.day")
+        month = [x for x in days if (x.year, x.month) == (d.year, d.month)]
+        chosen = month[-1]
+        for x in month:
+            if x.day >= dd:
+                chosen = x
+                break
+        return chosen == d
+    n = _cfg_get(raw, "deposit.n")
+    anchor = _cfg_get(raw, "deposit.anchor_date")
+    anchor = dt.date.fromisoformat(anchor if isinstance(anchor, str)
+                                   else str(anchor))
+    if d < anchor:
+        return False
+    idx = sum(1 for x in days if anchor <= x < d)
+    return idx % n == 0
 
 
 def get_status(store: Store) -> dict:
@@ -1040,33 +1359,68 @@ class FakeBroker:
     """In-memory, buy-only broker for tests (no network)."""
 
     def __init__(self, orderable_cash: Decimal, position: Decimal) -> None:
-        self._orderable_cash = orderable_cash
-        self._position = position
+        self._orderable_cash = Decimal(orderable_cash)
+        self._position = Decimal(position)
+        self._orders: list[BrokerOrder] = []
+        self._next_id = 1
+        self._fail_mode: str | None = None
         self.place_calls = 0
 
     def get_orderable_cash_usd(self) -> Decimal:
-        raise NotImplementedError("FakeBroker.get_orderable_cash_usd")
+        return self._orderable_cash
 
     def get_position(self, symbol: str) -> Decimal:
-        raise NotImplementedError("FakeBroker.get_position")
+        return self._position
 
     def place_loc_buy(self, request: OrderRequest) -> str:
-        raise NotImplementedError("FakeBroker.place_loc_buy")
+        self.place_calls += 1
+        mode, self._fail_mode = self._fail_mode, None
+        if mode == "timeout":
+            raise BrokerTimeout("timeout")
+        if mode == "reject":
+            raise BrokerRejected("rejected")
+        if mode == "error":
+            raise BrokerError("error")
+        bid = f"FB-{self._next_id}"
+        self._next_id += 1
+        self._orderable_cash -= request.quantity * request.limit_price
+        self._orders.append(BrokerOrder(
+            bid, request.client_order_id, request.symbol, "BUY",
+            request.quantity, request.limit_price, request.trade_date, "OPEN"))
+        if mode == "timeout_after_accept":
+            raise BrokerTimeout("timeout after accept")
+        return bid
 
     def list_orders(self, trade_date: dt.date) -> list[BrokerOrder]:
-        raise NotImplementedError("FakeBroker.list_orders")
+        return [o for o in self._orders if o.trade_date == trade_date]
 
     def settle_close(self, trade_date: dt.date, close: Decimal) -> None:
-        raise NotImplementedError("FakeBroker.settle_close")
+        import dataclasses
+        from decimal import ROUND_HALF_UP
+
+        close = Decimal(close)
+        for i, o in enumerate(self._orders):
+            if o.trade_date != trade_date or o.status != "OPEN":
+                continue
+            reserved = o.quantity * o.limit_price
+            if close <= o.limit_price:
+                cost = _q(o.quantity * close, "0.01", ROUND_HALF_UP)
+                self._position += o.quantity
+                self._orderable_cash += reserved - cost
+                self._orders[i] = dataclasses.replace(
+                    o, status="FILLED", fill_price=close)
+            else:
+                self._orderable_cash += reserved
+                self._orders[i] = dataclasses.replace(o, status="UNFILLED")
 
     def set_position(self, qty: Decimal) -> None:
-        raise NotImplementedError("FakeBroker.set_position")
+        self._position = Decimal(qty)
 
     def set_orderable_cash(self, amount: Decimal) -> None:
-        raise NotImplementedError("FakeBroker.set_orderable_cash")
+        self._orderable_cash = Decimal(amount)
 
     def fail_next_place(self, mode: str) -> None:
-        raise NotImplementedError("FakeBroker.fail_next_place")
+        self._fail_mode = mode
 
 
 class FakeNotifier:
