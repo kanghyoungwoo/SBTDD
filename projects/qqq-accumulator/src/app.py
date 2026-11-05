@@ -1270,6 +1270,41 @@ def _reconcile(store: Store, broker, config: Config, now, tz) -> None:
             store._set_order_status(o["id"], "REJECTED", match.broker_order_id)
 
 
+def _send_daily_summary(store, notifier, now, tz, ny_date) -> None:
+    try:
+        local_now = now.astimezone(tz)
+        rows = store._conn.execute(
+            "SELECT date, close_time FROM calendar "
+            "WHERE is_open = 1 AND date <= ? ORDER BY date DESC",
+            (ny_date.isoformat(),)).fetchall()
+        for d, close in rows:
+            day = dt.date.fromisoformat(d)
+            close_t = dt.datetime.strptime(close or "16:00", "%H:%M").time()
+            if local_now < dt.datetime.combine(day, close_t, tzinfo=tz):
+                continue
+            if store._first_notification(day, "DAILY_SUMMARY", "DAILY_SUMMARY"):
+                orders = [o for o in store._orders_raw()
+                          if str(o["trade_date"]) == d] \
+                    if _orders_have_trade_date(store) else []
+                text = (f"{d} summary: "
+                        + (", ".join(str(o["status"]) for o in orders)
+                           if orders else "no order"))
+                _safe_send(notifier, Notification(
+                    kind="DAILY_SUMMARY", trade_date=day,
+                    reason="DAILY_SUMMARY", text=text))
+            return
+    except Exception:
+        return
+
+
+def _orders_have_trade_date(store) -> bool:
+    try:
+        rows = store._orders_raw()
+        return bool(rows) and "trade_date" in rows[0].keys()
+    except Exception:
+        return False
+
+
 def _run_once_body(config, store, broker, notifier, now, tz, ny_date):
     from decimal import ROUND_CEILING  # noqa: F401
 
@@ -1318,6 +1353,7 @@ def _run_once_body(config, store, broker, notifier, now, tz, ny_date):
         return finish(2, "BROKER_ERROR")
     if position != store.holdings():
         store._set_halt("POSITION_MISMATCH")
+    _send_daily_summary(store, notifier, now, tz, ny_date)
     if "POSITION_MISMATCH" in store._active_halts():
         return finish(1, "POSITION_MISMATCH")
     if any(o["status"] in ("SENDING", "UNKNOWN") for o in store._orders_raw()):
