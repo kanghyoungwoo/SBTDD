@@ -234,7 +234,7 @@ def verification_cli(root, manifest, *arguments):
         raise AgentError("verification_error", str(error)) from error
 
 
-def snapshot(root, manifest=None):
+def snapshot(root):
     return tree_snapshot(root, excluded=[root / ".harness"])
 
 

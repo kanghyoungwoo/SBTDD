@@ -150,10 +150,12 @@ def input_files(root, manifest):
 
 
 def fingerprint(root, manifest):
+    # Always rehashed from content: the fingerprint is the long-lived validity basis of results.
     digest = hashlib.sha256()
     for path in input_files(root, manifest):
         digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        with path.open("rb") as stream:
+            digest.update(hashlib.file_digest(stream, "sha256").digest())
     return digest.hexdigest()
 
 

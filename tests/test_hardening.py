@@ -1,11 +1,17 @@
+import hashlib
 import json
+import os
+from pathlib import Path
 import signal
 import subprocess
+import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
+from harness import guard
 from harness.agent import AgentError, invoke_codex, run_agent, verification_cli
-from harness.core import fingerprint, project_status
+from harness.core import fingerprint, input_files, load_manifest, project_status
 from tests import test_agent, test_cli, test_init, test_roles
 
 
@@ -326,6 +332,67 @@ class ProviderPreflightTests(unittest.TestCase):
         self.assertEqual((result['reason'], result['missing']), ('agent_missing', ['claude', 'codex']))
         claude.assert_not_called()
         self.assertEqual([p.name for p in (project / result['draft']).iterdir()], ['BRIEF.md'])
+
+
+class SnapshotTests(unittest.TestCase):
+    """Digests are reused only for settled files whose stat signature did not change."""
+    save = test_cli.HarnessTests.save
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.file = self.root / 'data.txt'
+        self.file.write_text('aaaa', encoding='utf-8')
+        cache = patch.dict(guard._digests, clear=True)
+        cache.start()
+        self.addCleanup(cache.stop)
+
+    def settled(self):
+        """Pretend an hour has passed, so current files are outside the settle window."""
+        return patch('harness.guard.time.time_ns', return_value=time.time_ns() + 3_600_000_000_000)
+
+    def hash_count(self):
+        with patch('harness.guard.hashlib.file_digest', wraps=hashlib.file_digest) as digest:
+            tree_snapshot = guard.tree_snapshot(self.root)
+        return digest.call_count, tree_snapshot
+
+    def test_unchanged_settled_file_is_not_hashed_again(self):
+        with self.settled():
+            self.assertEqual(self.hash_count()[0], 1)
+            count, snapshot = self.hash_count()
+        self.assertEqual(count, 0)
+        self.assertEqual(snapshot['data.txt'], hashlib.sha256(b'aaaa').hexdigest())
+
+    def test_recently_written_file_is_hashed_every_time(self):
+        self.assertEqual(self.hash_count()[0], 1)
+        self.assertEqual(self.hash_count()[0], 1)
+
+    def test_same_size_rewrite_is_detected_after_reuse(self):
+        with self.settled():
+            before = guard.tree_snapshot(self.root)
+        self.file.write_text('bbbb', encoding='utf-8')
+        self.assertEqual(guard.changed_paths(before, guard.tree_snapshot(self.root)), ['data.txt'])
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has no inode change time; SPEC documents this limit')
+    def test_rewrite_with_restored_timestamps_is_detected_on_posix(self):
+        original = self.file.stat()
+        with self.settled():
+            before = guard.tree_snapshot(self.root)
+            self.file.write_text('bbbb', encoding='utf-8')
+            os.utime(self.file, ns=(original.st_atime_ns, original.st_mtime_ns))
+            self.assertEqual(self.file.stat().st_mtime_ns, original.st_mtime_ns)
+            after = guard.tree_snapshot(self.root)
+        self.assertEqual(guard.changed_paths(before, after), ['data.txt'])
+
+    def test_streamed_fingerprint_keeps_existing_records_valid(self):
+        test_cli.HarnessTests.setUp(self)
+        manifest = load_manifest(self.root)
+        expected = hashlib.sha256()
+        for path in input_files(self.root, manifest):
+            expected.update(path.relative_to(self.root).as_posix().encode('utf-8') + b'\0')
+            expected.update(hashlib.sha256(path.read_bytes()).digest())
+        self.assertEqual(fingerprint(self.root, manifest), expected.hexdigest())
 
 
 class ExecutionBoundaryTests(unittest.TestCase):

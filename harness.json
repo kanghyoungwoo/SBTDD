@@ -23,6 +23,7 @@
     {"id": "SCN-RUN-FAIL", "requirement": "REQ-RUN", "given": "테스트 실패, 실행 오류 또는 시간 초과가 발생한다", "when": "검사를 실행한다", "then": "실패 원인을 기록하고 나머지 선택 검사도 실행한다"},
     {"id": "SCN-UNVERIFIED", "requirement": "REQ-STATE", "given": "검사를 실행한 기록이 없다", "when": "상태를 조회한다", "then": "파일을 생성하지 않고 unverified를 반환한다"},
     {"id": "SCN-STALE", "requirement": "REQ-STATE", "given": "통과 기록 이후 명세나 추적 파일이 바뀌었다", "when": "상태를 조회한다", "then": "기존 결과를 stale로 표시한다"},
+    {"id": "SCN-STATE-COMPAT", "requirement": "REQ-STATE", "given": "이전 버전이 남긴 실행 기록이 있다", "when": "새 버전으로 상태를 조회한다", "then": "입력이 같으면 같은 fingerprint를 계산해 기존 결과를 stale로 만들지 않는다"},
     {"id": "SCN-PARTIAL", "requirement": "REQ-EVIDENCE", "given": "여러 요구사항이 등록되어 있다", "when": "요구사항 하나씩 선택해 실행한다", "then": "선택한 검사만 실행하며 다른 검사의 기록을 보존한다"},
     {"id": "SCN-RUN-CHANGE", "requirement": "REQ-EVIDENCE", "given": "검사 실행 중 추적 파일이 변경된다", "when": "검사 명령이 정상 종료된다", "then": "실행 기록은 보존하지만 검증 상태는 stale이다"},
     {"id": "SCN-CORRUPT", "requirement": "REQ-EVIDENCE", "given": "실행 이력 파일의 필수 내용이 손상되었다", "when": "상태를 조회한다", "then": "손상된 기록을 통과 근거로 사용하지 않고 오류를 반환한다"},
@@ -49,6 +50,7 @@
     {"id": "SCN-GUARD-SCOPE", "requirement": "REQ-GUARD", "given": "AI가 추적 입력 밖의 파일을 바꾸거나 허용 경로 안의 캐시·환경 폴더에 파일을 쓴다", "when": "호출 결과를 확인한다", "then": "변경 파일을 기록하고 검증·검토 전에 needs_input으로 중단한다"},
     {"id": "SCN-GUARD-EVIDENCE", "requirement": "REQ-GUARD", "given": "AI 호출이나 검사 명령이 실행 기록을 추가·수정·삭제한다", "when": "호출이나 검사가 끝난다", "then": "무결성 표시를 남기고 이후 이력을 통과 근거로 사용하지 않는다"},
     {"id": "SCN-GUARD-VERIFIER", "requirement": "REQ-GUARD", "given": "프로젝트에 harness.py나 sitecustomize.py가 있다", "when": "실행기가 검증 CLI를 호출한다", "then": "프로젝트 코드가 아닌 Harness 검증기가 실행된다"},
+    {"id": "SCN-GUARD-REUSE", "requirement": "REQ-GUARD", "given": "크기와 시각이 그대로이고 충분히 오래된 파일이 많다", "when": "AI 호출 전후로 프로젝트를 다시 비교한다", "then": "그 파일은 다시 해시하지 않지만 같은 크기의 덮어쓰기와 POSIX에서 시각을 되돌린 덮어쓰기는 감지한다"},
     {"id": "SCN-RECOVERY-REPAIR", "requirement": "REQ-RECOVERY", "given": "AI가 스키마에 맞지 않는 응답을 반환한다", "when": "응답을 처리한다", "then": "도구와 쓰기 없이 형식 보정을 한 번만 시도하고 다시 맞지 않으면 invalid_response로 끝낸다"},
     {"id": "SCN-RECOVERY-SIGNAL", "requirement": "REQ-RECOVERY", "given": "실행 중 SIGINT·SIGTERM이나 시간 초과가 발생한다", "when": "Harness가 중단을 처리한다", "then": "자식 프로세스 트리를 정리하고 interrupted 상태와 기록을 남긴다"},
     {"id": "SCN-DOCTOR", "requirement": "REQ-PREFLIGHT", "given": "CLI 설치·로그인 상태가 다양하다", "when": "doctor를 실행한다", "then": "모델을 호출하거나 계정 정보를 노출하지 않고 항목별 원인과 조치를 반환한다"},
@@ -83,14 +85,15 @@
         "tests.test_cli.HarnessTests.test_unknown_requirement"]
     },
     {
-      "id": "CHK-STATE", "kind": "acceptance", "scenarios": ["SCN-UNVERIFIED", "SCN-STALE"],
+      "id": "CHK-STATE", "kind": "acceptance", "scenarios": ["SCN-UNVERIFIED", "SCN-STALE", "SCN-STATE-COMPAT"],
       "timeout_seconds": 120,
       "command": ["{python}", "-B", "-m", "unittest", "-v",
         "tests.test_cli.HarnessTests.test_unverified_status",
         "tests.test_cli.HarnessTests.test_changed_inputs_are_stale",
         "tests.test_cli.HarnessTests.test_changed_contract_is_stale",
         "tests.test_cli.HarnessTests.test_directory_addition_and_deletion",
-        "tests.test_cli.HarnessTests.test_run_records_and_cache_are_not_inputs"]
+        "tests.test_cli.HarnessTests.test_run_records_and_cache_are_not_inputs",
+        "tests.test_hardening.SnapshotTests.test_streamed_fingerprint_keeps_existing_records_valid"]
     },
     {
       "id": "CHK-EVIDENCE", "kind": "acceptance", "scenarios": ["SCN-PARTIAL", "SCN-RUN-CHANGE", "SCN-CORRUPT"],
@@ -104,7 +107,7 @@
     {"id": "CHK-ROLES", "kind": "acceptance", "scenarios": ["SCN-ROLES-CYCLE", "SCN-ROLES-REVIEW", "SCN-ROLES-EVIDENCE", "SCN-ROLES-BOUNDARY", "SCN-ROLES-GREEN", "SCN-ROLES-PROTOCOL", "SCN-ROLES-RULES"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_roles", "tests.test_agent.CodexAdapterTests.test_prompts_forbid_unverified_claims"]},
     {"id": "CHK-INIT", "kind": "acceptance", "scenarios": ["SCN-INIT-GENERATE", "SCN-INIT-RED", "SCN-INIT-PRESERVE", "SCN-INIT-QUESTION", "SCN-INIT-HANDOFF"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_init", "tests.test_hardening.InitBoundaryTests.test_scaffold_red_diagnostic_reports_invalid_execution"]},
     {
-      "id": "CHK-GUARD", "kind": "acceptance", "scenarios": ["SCN-GUARD-SCOPE", "SCN-GUARD-EVIDENCE", "SCN-GUARD-VERIFIER"],
+      "id": "CHK-GUARD", "kind": "acceptance", "scenarios": ["SCN-GUARD-SCOPE", "SCN-GUARD-EVIDENCE", "SCN-GUARD-VERIFIER", "SCN-GUARD-REUSE"],
       "timeout_seconds": 180,
       "command": ["{python}", "-B", "-m", "unittest", "-v",
         "tests.test_hardening.BoundaryTests.test_untracked_test_runner_shadow_is_rejected_before_verification",
@@ -120,7 +123,11 @@
         "tests.test_hardening.InitBoundaryTests.test_init_protects_outer_evidence",
         "tests.test_hardening.InitBoundaryTests.test_init_protects_draft_run_history_too",
         "tests.test_hardening.ExecutionBoundaryTests.test_checks_cannot_forge_history",
-        "tests.test_hardening.ExecutionBoundaryTests.test_verifier_ignores_project_sitecustomize_from_pythonpath"]
+        "tests.test_hardening.ExecutionBoundaryTests.test_verifier_ignores_project_sitecustomize_from_pythonpath",
+        "tests.test_hardening.SnapshotTests.test_unchanged_settled_file_is_not_hashed_again",
+        "tests.test_hardening.SnapshotTests.test_recently_written_file_is_hashed_every_time",
+        "tests.test_hardening.SnapshotTests.test_same_size_rewrite_is_detected_after_reuse",
+        "tests.test_hardening.SnapshotTests.test_rewrite_with_restored_timestamps_is_detected_on_posix"]
     },
     {
       "id": "CHK-RECOVERY", "kind": "acceptance", "scenarios": ["SCN-RECOVERY-REPAIR", "SCN-RECOVERY-SIGNAL"],
