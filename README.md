@@ -1,3 +1,227 @@
+# SDD · BDD · TDD Harness
+
+**명세에서 비즈니스 시나리오, 테스트, 구현, 검토까지 연결하는 개발 하네스입니다.**
+
+Claude가 설계·검토하고 Codex가 코드를 구현합니다. 공통 검증 CLI가 테스트를 직접 실행하고, 어떤 요구사항을 어떤 검사로 확인했는지 실행 증거를 남깁니다. AI 없이 검증 CLI만 사용할 수도 있습니다.
+
+> An SDD/BDD/TDD development harness with traceable specifications, automated verification, Claude design and review, and Codex implementation.
+
+## 어떤 문제를 해결하나요?
+
+AI가 코드를 작성한 뒤에도 확인해야 할 것이 있습니다. 원래 요구사항을 구현했는지, 테스트가 실제 비즈니스 동작을 검증하는지, 기존 기능을 깨뜨리지 않았는지입니다.
+
+Harness는 세 가지 개발 방식을 연결해 이 확인 과정을 명시적으로 만듭니다.
+
+| 계층 | 책임 | 주요 산출물 |
+| --- | --- | --- |
+| SDD — 명세 중심 개발 | 구현할 요구사항과 설계·범위를 정의 | `BRIEF.md`, `SPEC.md`, 요구사항 ID |
+| BDD — 행위 중심 개발 | 관찰 가능한 비즈니스 동작을 구체화 | Given / When / Then 시나리오 |
+| TDD — 테스트 주도 개발 | 실패 확인 → 최소 구현 → 통과·회귀 확인 | 테스트 코드와 실제 실행 기록 |
+
+`harness.json`은 **요구사항 → 시나리오 → 검사 명령**을 연결하는 실행 가능한 계약입니다. 개발자와 AI 실행기가 같은 CLI와 JSON 결과를 사용합니다.
+
+## 주요 기능
+
+- 요구사항·시나리오·acceptance 검사 사이의 참조와 누락 검증
+- 검사별 종료 코드, 출력, 실행 시간과 실패 원인 저장
+- 입력 파일의 해시를 비교해 이전 결과가 오래되었는지 확인
+- 자연어 요구사항으로 빈 Python 프로젝트의 명세·BDD·API 뼈대·테스트 생성
+- Claude 설계 → Codex 테스트·구현 → CLI 검증 → Claude 검토 실행
+- 수정 범위와 증거 변경 감지, 제한된 구현 재시도, 중단 사유 기록
+- CLI·로그인·프로젝트 환경을 확인하는 `doctor`와 Claude Code용 워크플로 스킬
+
+## 준비 사항
+
+| 사용 방식 | 필요한 환경 |
+| --- | --- |
+| `check`, `run`, `status` | Python 3.11 이상, 프로젝트 검사 명령에 필요한 도구 |
+| `agent`의 `codex` 흐름 | 위 환경 + 설치·로그인된 Codex CLI |
+| `init`, `agent`의 `claude-codex` 흐름 | 위 환경 + 설치·로그인된 Claude CLI |
+
+Harness의 Python 런타임 의존성은 표준 라이브러리뿐입니다. AI 실행기는 설치된 CLI의 로그인과 모델 설정을 사용합니다. 실제 모델 호출은 해당 계정의 사용량을 소모합니다.
+
+저장소를 내려받은 뒤 **저장소 루트에서** 아래 명령을 실행합니다. 가상환경은 선택 사항입니다.
+
+```powershell
+python --version
+python -m harness --help
+```
+
+다른 디렉터리에서도 사용하려면 선택적으로 로컬 패키지를 설치할 수 있습니다.
+
+```powershell
+python -m pip install -e .
+harness --help
+```
+
+## 빠른 시작: AI 없이 예제 검증하기
+
+기본 검증 기능은 AI CLI나 로그인 없이 실행할 수 있습니다.
+
+```powershell
+python -B -m harness --root examples/inventory check
+python -B -m harness --root examples/inventory run
+python -B -m harness --root examples/inventory status
+```
+
+재고 예제는 재고 부족 예약 거절, 정상 예약, 재고가 정확히 소진되는 경계 조건을 검사합니다. 순서대로 계약의 `valid`, 실행의 `passed`, 현재 상태의 `passed`를 확인할 수 있습니다.
+
+`inventory.py`를 변경하고 `status`를 다시 실행하면 이전 결과가 `stale`로 바뀝니다. `run`을 다시 실행하면 현재 파일에 대한 검증 기록을 만듭니다.
+
+> `--root`는 항상 하위 명령 **앞에** 둡니다. 예: `harness --root PROJECT run`.
+
+## 새 프로젝트: 자연어 요구사항에서 시작하기
+
+### 1. 환경 확인
+
+CLI를 설치하고 각 도구의 로그인 절차를 완료합니다.
+
+```powershell
+codex login
+claude auth login
+python -B -m harness doctor
+```
+
+`doctor`는 Python, CLI 경로·버전·로그인 상태, 프로젝트 접근 가능 여부, 존재하는 계약과 증거 무결성 표시를 확인합니다. 기존 `harness.json`이 없어도 사용할 수 있습니다. 모델 호출이나 잔여 사용량 확인은 수행하지 않습니다.
+
+Codex만 사용할 때는 `doctor --provider codex`, Claude만 확인할 때는 `doctor --provider claude`를 사용합니다.
+
+### 2. 요구사항 작성 및 초기화
+
+UTF-8 텍스트 파일에 원하는 기능, 구체적인 입력·출력 예, 오류 처리 또는 호출자 사전조건, 제외 범위를 작성합니다. [예제 요구사항](examples/new_project_brief.md)을 참고할 수 있습니다.
+
+```powershell
+python -B -m harness --root ../NewProject init --brief examples/new_project_brief.md
+```
+
+`--brief`의 상대 경로는 명령을 실행한 디렉터리 기준입니다. 대상 프로젝트는 아직 없거나, 원본 요구 파일 하나와 `.harness` 이력을 제외하고 비어 있어야 합니다. 가상환경이나 Git 저장소를 만들기 전의 빈 대상 폴더를 사용합니다.
+
+초기화는 다음 순서로 진행합니다.
+
+1. Claude가 요구사항·설계·Given/When/Then을 구조화합니다.
+2. Harness가 `BRIEF.md`, `SPEC.md`, `harness.json`과 시나리오별 검사 명령을 만듭니다.
+3. Codex가 `src/`에 미구현 API 뼈대, `tests/`에 실제 기대 결과를 단정하는 unittest 테스트를 작성합니다.
+4. 공통 CLI가 초안을 검사하고, 모든 시나리오의 테스트가 `src/`의 `NotImplementedError` 때문에 실패하는지 확인합니다.
+5. 조건을 충족한 파일을 대상에 배치하고 `ready`를 반환합니다.
+
+**`ready`는 구현 준비 완료입니다. 이 시점의 테스트는 의도적으로 실패합니다.** 빈 테스트, import 오류, 테스트 본문의 인위적인 실패, 이미 통과하는 구현은 유효한 초기 Red로 인정하지 않습니다.
+
+생성되는 프로젝트 구조는 다음과 같습니다.
+
+```text
+NewProject/
+├── BRIEF.md        # 원본 요구사항 사본
+├── SPEC.md         # 설계·요구사항·비즈니스 시나리오
+├── harness.json    # 추적 관계·검사 명령·AI 수정 범위
+├── src/            # 미구현 API 뼈대
+├── tests/          # 시나리오별 테스트
+└── .harness/       # 초안·실행 기록·AI 응답과 로그
+```
+
+### 3. 명세 확인 후 구현 실행
+
+생성된 명세와 시나리오가 원래 요구를 반영했는지 확인한 뒤 실행합니다.
+
+```powershell
+python -B -m harness --root ../NewProject agent
+python -B -m harness --root ../NewProject status
+```
+
+`init`은 구현을 자동 시작하지 않습니다. 응답의 `next_command`는 첫 요구사항을 명시적으로 선택하는 실행 명령입니다. 요구사항이 여러 개라면 `agent --requirement ID`로 하나씩 처리합니다.
+
+질문이 반환되면 `question`, `message`, `draft`를 확인하고 요구사항을 보완합니다. 이미 초기화된 프로젝트에는 `init`을 다시 적용하지 않고 기존 계약을 검토한 뒤 `agent`를 사용합니다.
+
+## 기존 프로젝트에서 사용하기
+
+기존 테스트 명령과 요구사항을 `harness.json`에 연결합니다. 다음은 [재고 예제 계약](examples/inventory/harness.json)을 단순화한 예입니다.
+
+```json
+{
+  "version": 1,
+  "inputs": ["inventory.py", "test_inventory.py"],
+  "agent": {
+    "workflow": "claude-codex",
+    "code_paths": ["inventory.py"],
+    "test_paths": ["test_inventory.py"]
+  },
+  "requirements": [
+    {"id": "REQ-STOCK", "description": "재고가 부족하면 예약을 거절하고 기존 재고를 유지한다."}
+  ],
+  "scenarios": [
+    {
+      "id": "SCN-REJECT",
+      "requirement": "REQ-STOCK",
+      "given": "재고가 2개다",
+      "when": "3개를 예약한다",
+      "then": "예약을 거절하고 재고 2개를 유지한다"
+    }
+  ],
+  "checks": [
+    {
+      "id": "CHK-REJECT",
+      "kind": "acceptance",
+      "scenarios": ["SCN-REJECT"],
+      "command": ["{python}", "-B", "-m", "unittest", "test_inventory.InventoryTests.test_rejects_insufficient_stock"],
+      "timeout_seconds": 30
+    }
+  ]
+}
+```
+
+계약의 주요 규칙은 다음과 같습니다.
+
+- ID는 계약 전체에서 고유해야 합니다. 모든 요구사항에 시나리오, 모든 시나리오에 acceptance 검사가 필요합니다.
+- 하나의 검사에 여러 시나리오를 연결할 수 있습니다. `unit` 검사는 필요한 경우 추가합니다.
+- 입력 경로는 프로젝트 내부의 기존 파일·디렉터리여야 합니다. `harness.json` 자체는 항상 추적합니다.
+- 명령은 프로젝트 루트에서 실행하는 인자 배열입니다. `{python}`은 Harness를 실행한 Python으로 치환합니다. 셸 문법은 해석하지 않습니다.
+- 검사 명령의 종료 코드 0을 통과로 처리합니다. 명령이 실제 assertion을 실행하도록 구성해야 합니다.
+- 검증 CLI만 사용할 때는 `agent` 설정을 생략할 수 있습니다.
+
+AI를 사용하려면 `code_paths`와 `test_paths`를 지정합니다. 두 범위는 서로 겹치지 않는 기존 경로이며 `inputs`가 추적하는 범위 안에 있어야 합니다.
+
+```powershell
+python -B -m harness --root examples/inventory agent --requirement REQ-STOCK --max-attempts 3 --timeout-seconds 300
+```
+
+`workflow`는 `claude-codex` 또는 `codex`입니다. 생략하면 Codex 단독 흐름을 사용합니다.
+
+## AI 역할과 완료 조건
+
+```mermaid
+flowchart TD
+    A[기존 계약과 기준 검사] --> B[Claude 구현 설계]
+    B --> C[Codex 테스트 준비]
+    C --> D[CLI로 Red 확인]
+    D --> E[Codex 구현]
+    E --> F[CLI 전체 검사]
+    F -->|대상 통과·새 회귀 없음| G[Claude 검토]
+    F -->|검사 실패| E
+    G -->|수정 요청| E
+    G -->|승인| H[완료]
+```
+
+위 그림은 실패한 요구사항을 처리하는 `claude-codex` 흐름입니다. 구현·검토 재작업은 `--max-attempts` 한도 안에서 수행합니다. `--timeout-seconds`는 AI 호출별 제한이며 기본값은 300초입니다.
+
+| 역할 | 수행 작업 | 수정 범위 |
+| --- | --- | --- |
+| Claude 설계 | 기존 명세와 코드에서 구현 계획·테스트 전략 작성 | 읽기 전용 |
+| Codex 테스트 | 기존 실패 테스트를 검토하거나 새 테스트 파일 추가 | `test_paths`에 새 파일만 추가 |
+| Codex 구현 | 선택한 요구사항 구현 및 발생한 회귀 수정 | `code_paths` |
+| 검증 CLI | 실제 검사 실행 및 상태 계산 | 실행 증거 저장 |
+| Claude 검토 | 명세·코드·테스트·diff·검사 증거 검토 | 읽기 전용 |
+
+이미 충분한 실패 테스트가 있으면 새 테스트 추가를 강제하지 않습니다. 설계와 검토는 별도 세션에서 실행합니다. 명세나 기존 테스트를 수정해야 하면 `needs_input`으로 중단합니다.
+
+자동 선택은 계약 순서의 첫 미통과 요구사항입니다. 이미 모든 검사가 통과한 프로젝트를 Claude로 검토하려면 `--requirement ID`를 지정합니다. 이 경우 설계·검토를 거쳐 승인되면 코드 수정 없이 완료할 수 있습니다.
+
+Codex 단독 흐름은 Claude 단계를 생략하며, 이미 통과한 대상은 AI 호출 없이 종료합니다. 구현 후 완료 판정은 이번 실행에서 새로 얻은 검사 결과를 사용합니다. 선택한 요구사항의 통과와 기존 통과 검사의 회귀 해소가 필요하며, Claude 흐름에는 검토 승인도 필요합니다.
+
+## 명령 모음
+
+아래 명령의 `PROJECT`, `ID`, `FILE`은 실제 경로·ID로 바꿉니다. `--root`를 생략하면 현재 디렉터리를 대상으로 합니다.
+
+| 명령 | 역할 |
+| --- | --- |
 | `python -m harness --root PROJECT doctor` | 로컬 CLI·로그인·프로젝트 사전 점검 |
 | `python -m harness --root PROJECT check` | 계약 형식·참조·입력 경로 검증 |
 | `python -m harness --root PROJECT run` | 전체 검사 실행·증거 저장 |
@@ -122,3 +346,7 @@ python -B -m harness status
 한 번의 AI 개발 실행은 요구사항 하나를 처리합니다. 같은 프로젝트의 동시 실행 조율·병렬 개발·세션 재개는 지원하지 않습니다. 명세 근거의 구조화된 표시와 별도 독립 QA 단계도 향후 검토 대상입니다.
 
 테스트 통과와 Claude 승인은 검증 근거입니다. 생성된 명세의 업무적 가정과 테스트가 실제 사용자 의도를 충분히 반영하는지는 사람이 함께 확인해야 합니다.
+
+## 라이선스
+
+이 프로젝트는 [MIT License](LICENSE)를 따릅니다.

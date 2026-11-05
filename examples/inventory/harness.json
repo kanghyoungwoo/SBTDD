@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "inputs": ["inventory.py", "test_inventory.py"],
+  "agent": {"workflow": "claude-codex", "code_paths": ["inventory.py"], "test_paths": ["test_inventory.py"]},
+  "requirements": [
+    {"id": "REQ-STOCK", "description": "재고 내 수량은 예약하고, 재고 초과 예약은 재고 변경 없이 거절한다. 호출자가 stock은 0 이상의 정수, quantity는 양의 정수임을 보장한다. 이는 사전조건이며 입력 타입·부호의 런타임 검증은 이 요구사항의 범위에 포함하지 않는다."}
+  ],
+  "scenarios": [
+    {"id": "SCN-REJECT", "requirement": "REQ-STOCK", "given": "재고가 2개다", "when": "3개를 예약한다", "then": "예약을 거절하고 재고 2개를 유지한다"},
+    {"id": "SCN-RESERVE", "requirement": "REQ-STOCK", "given": "재고가 5개다", "when": "2개를 예약한다", "then": "예약에 성공하고 재고 3개가 남는다"}
+  ],
+  "checks": [
+    {"id": "CHK-REJECT", "kind": "acceptance", "scenarios": ["SCN-REJECT"], "command": ["{python}", "-B", "-m", "unittest", "test_inventory.InventoryTests.test_rejects_insufficient_stock"]},
+    {"id": "CHK-RESERVE", "kind": "acceptance", "scenarios": ["SCN-RESERVE"], "command": ["{python}", "-B", "-m", "unittest", "test_inventory.InventoryTests.test_reserves_available_stock"]},
+    {"id": "CHK-BOUNDARY", "kind": "unit", "scenarios": ["SCN-RESERVE"], "command": ["{python}", "-B", "-m", "unittest", "test_inventory.InventoryTests.test_reserves_exact_remaining_stock"]}
+  ]
+}
