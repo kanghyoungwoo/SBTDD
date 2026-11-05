@@ -51,6 +51,7 @@
     {"id": "SCN-GUARD-EVIDENCE", "requirement": "REQ-GUARD", "given": "AI 호출이나 검사 명령이 실행 기록을 추가·수정·삭제한다", "when": "호출이나 검사가 끝난다", "then": "무결성 표시를 남기고 이후 이력을 통과 근거로 사용하지 않는다"},
     {"id": "SCN-GUARD-VERIFIER", "requirement": "REQ-GUARD", "given": "프로젝트에 harness.py나 sitecustomize.py가 있다", "when": "실행기가 검증 CLI를 호출한다", "then": "프로젝트 코드가 아닌 Harness 검증기가 실행된다"},
     {"id": "SCN-GUARD-REUSE", "requirement": "REQ-GUARD", "given": "크기와 시각이 그대로이고 충분히 오래된 파일이 많다", "when": "AI 호출 전후로 프로젝트를 다시 비교한다", "then": "그 파일은 다시 해시하지 않지만 같은 크기의 덮어쓰기와 POSIX에서 시각을 되돌린 덮어쓰기는 감지한다"},
+    {"id": "SCN-GUARD-BENIGN", "requirement": "REQ-GUARD", "given": "AI 호출 중 IDE·OS·테스트 도구가 .git 내부 파일, 데이터 캐시, OS 메타데이터를 바꾼다", "when": "호출 결과를 확인한다", "then": "중단하지 않고 ignored_changes로 보고하며 진행으로 세지 않지만 git hooks·config·attributes와 bytecode 변경은 계속 중단한다"},
     {"id": "SCN-RECOVERY-REPAIR", "requirement": "REQ-RECOVERY", "given": "AI가 스키마에 맞지 않는 응답을 반환한다", "when": "응답을 처리한다", "then": "도구와 쓰기 없이 형식 보정을 한 번만 시도하고 다시 맞지 않으면 invalid_response로 끝낸다"},
     {"id": "SCN-RECOVERY-SIGNAL", "requirement": "REQ-RECOVERY", "given": "실행 중 SIGINT·SIGTERM이나 시간 초과가 발생한다", "when": "Harness가 중단을 처리한다", "then": "자식 프로세스 트리를 정리하고 interrupted 상태와 기록을 남긴다"},
     {"id": "SCN-DOCTOR", "requirement": "REQ-PREFLIGHT", "given": "CLI 설치·로그인 상태가 다양하다", "when": "doctor를 실행한다", "then": "모델을 호출하거나 계정 정보를 노출하지 않고 항목별 원인과 조치를 반환한다"},
@@ -107,7 +108,7 @@
     {"id": "CHK-ROLES", "kind": "acceptance", "scenarios": ["SCN-ROLES-CYCLE", "SCN-ROLES-REVIEW", "SCN-ROLES-EVIDENCE", "SCN-ROLES-BOUNDARY", "SCN-ROLES-GREEN", "SCN-ROLES-PROTOCOL", "SCN-ROLES-RULES"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_roles", "tests.test_agent.CodexAdapterTests.test_prompts_forbid_unverified_claims"]},
     {"id": "CHK-INIT", "kind": "acceptance", "scenarios": ["SCN-INIT-GENERATE", "SCN-INIT-RED", "SCN-INIT-PRESERVE", "SCN-INIT-QUESTION", "SCN-INIT-HANDOFF"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_init", "tests.test_hardening.InitBoundaryTests.test_scaffold_red_diagnostic_reports_invalid_execution"]},
     {
-      "id": "CHK-GUARD", "kind": "acceptance", "scenarios": ["SCN-GUARD-SCOPE", "SCN-GUARD-EVIDENCE", "SCN-GUARD-VERIFIER", "SCN-GUARD-REUSE"],
+      "id": "CHK-GUARD", "kind": "acceptance", "scenarios": ["SCN-GUARD-SCOPE", "SCN-GUARD-EVIDENCE", "SCN-GUARD-VERIFIER", "SCN-GUARD-REUSE", "SCN-GUARD-BENIGN"],
       "timeout_seconds": 180,
       "command": ["{python}", "-B", "-m", "unittest", "-v",
         "tests.test_hardening.BoundaryTests.test_untracked_test_runner_shadow_is_rejected_before_verification",
@@ -127,7 +128,8 @@
         "tests.test_hardening.SnapshotTests.test_unchanged_settled_file_is_not_hashed_again",
         "tests.test_hardening.SnapshotTests.test_recently_written_file_is_hashed_every_time",
         "tests.test_hardening.SnapshotTests.test_same_size_rewrite_is_detected_after_reuse",
-        "tests.test_hardening.SnapshotTests.test_rewrite_with_restored_timestamps_is_detected_on_posix"]
+        "tests.test_hardening.SnapshotTests.test_rewrite_with_restored_timestamps_is_detected_on_posix",
+        "tests.test_hardening.BenignChangeTests"]
     },
     {
       "id": "CHK-RECOVERY", "kind": "acceptance", "scenarios": ["SCN-RECOVERY-REPAIR", "SCN-RECOVERY-SIGNAL"],

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -139,6 +140,95 @@ class BoundaryTests(unittest.TestCase):
             result, codex = self.run_with(self.fix)
         self.assertEqual(result['reason'], 'scope_changed')
         codex.assert_not_called()
+
+
+class BenignChangeTests(unittest.TestCase):
+    """Concurrent tools rewrite these files; they are reported but neither block nor count as work."""
+    setUp = test_agent.AgentTests.setUp
+    save = test_cli.HarnessTests.save
+    run_with = test_agent.AgentTests.run_with
+
+    def make_repository(self):
+        (self.root / 'tests').mkdir(exist_ok=True)  # an existing folder; creating new folders is a real change
+        for name in ('index', 'HEAD', 'config', 'hooks/pre-commit.sample', 'refs/heads/main'):
+            path = self.root / '.git' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('original\n', encoding='utf-8')
+
+    def test_git_internals_caches_and_os_metadata_are_reported_not_blocking(self):
+        self.make_repository()
+        benign = ['.git/index', '.git/FETCH_HEAD', '.git/objects/ab/cdef', '.git/refs/heads/main',
+                  '.pytest_cache/v/cache/lastfailed', 'tests/.mypy_cache/3.13/cache.json',
+                  '.coverage', '.DS_Store', 'Thumbs.db', 'desktop.ini']
+        def change(root, context, *args):
+            if context['phase'] == 'implement':
+                (root / 'logic.py').write_text('VALUE = 2\n', encoding='utf-8')
+                for name in benign:
+                    (root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (root / name).write_text('rewritten by another tool\n', encoding='utf-8')
+            return test_agent.response()
+        result, _ = self.run_with(change)
+        self.assertEqual(result['status'], 'passed')
+        implement = next(p for p in result['phases'] if p.get('phase') == 'implement' and 'provider' in p)
+        self.assertEqual(implement['changed_files'], ['logic.py'])
+        self.assertEqual(implement['ignored_change_count'], len(implement['ignored_changes']))
+        self.assertTrue(set(benign) <= set(implement['ignored_changes']))
+
+    def test_git_hooks_configuration_and_attributes_still_stop(self):
+        for name in ('.git/hooks/pre-commit', '.git/config', '.git/info/attributes',
+                     '.git/modules/lib/hooks/post-checkout', '.git/modules/lib/config',
+                     '.git/worktrees/side/config.worktree'):
+            with self.subTest(name=name):
+                self.make_repository()
+                def change(root, context, *args):
+                    if context['phase'] == 'implement':
+                        (root / 'logic.py').write_text('VALUE = 2\n', encoding='utf-8')
+                        (root / name).parent.mkdir(parents=True, exist_ok=True)
+                        (root / name).write_text('#!/bin/sh\necho injected\n', encoding='utf-8')
+                    return test_agent.response()
+                result, _ = self.run_with(change)
+                self.assertEqual(result['reason'], 'scope_changed')
+                self.assertIn(name, result['changed_files'])
+                shutil.rmtree(self.root / '.git')
+                (self.root / 'logic.py').write_text('VALUE = 3\n', encoding='utf-8')
+
+    def test_replacing_the_git_entry_still_stops(self):
+        (self.root / '.git').write_text('gitdir: ../elsewhere\n', encoding='utf-8')
+        def change(root, context, *args):
+            if context['phase'] == 'implement':
+                (root / '.git').write_text('gitdir: ../attacker\n', encoding='utf-8')
+            return test_agent.response()
+        result, _ = self.run_with(change)
+        self.assertEqual(result['reason'], 'scope_changed')
+        self.assertIn('.git', result['changed_files'])
+
+    def test_bytecode_and_environments_are_never_benign(self):
+        for name in ('__pycache__/logic.cpython-313.pyc', '.venv/lib/site-packages/inject.pth',
+                     '.pytest_cache/../__pycache__/x.pyc'):
+            normalized = os.path.normpath(name).replace(os.sep, '/')
+            self.assertFalse(guard.is_benign_change(normalized), normalized)
+
+    def test_benign_changes_alone_are_no_progress(self):
+        self.make_repository()
+        def change(root, context, *args):
+            if context['phase'] == 'implement':
+                (root / '.git' / 'index').write_text('refreshed\n', encoding='utf-8')
+            return test_agent.response()
+        result, _ = self.run_with(change)
+        self.assertEqual((result['status'], result['reason']), ('failed', 'no_progress'))
+
+    def test_os_metadata_in_evidence_does_not_mark_history_untrusted(self):
+        def change(root, context, *args):
+            if context['phase'] == 'implement':
+                (root / 'logic.py').write_text('VALUE = 2\n', encoding='utf-8')
+                (root / '.harness' / '.DS_Store').write_bytes(b'finder state')
+                (root / '.harness' / 'runs' / 'Thumbs.db').write_bytes(b'explorer state')
+            return test_agent.response()
+        result, _ = self.run_with(change)
+        self.assertEqual(result['status'], 'passed')
+        self.assertFalse((self.root / '.harness' / 'integrity-violation.json').exists())
+        self.assertEqual(project_status(self.root, self.manifest, fingerprint(self.root, self.manifest))['status'],
+                         'passed')
 
 
 class InitBoundaryTests(unittest.TestCase):

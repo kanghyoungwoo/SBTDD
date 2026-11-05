@@ -100,10 +100,23 @@ fingerprint의 inputs 추적과 별도로, 실행기는 AI 호출마다 호출 �
 
 - 현재 단계의 허용 경로 밖 변경. 설계·검토·응답 보정에는 허용 경로가 없다.
 - 테스트 단계의 기존 파일 수정·삭제와 심볼릭 링크 생성.
-- 허용 경로 안이라도 `.git`, `.harness`, `.venv`, `__pycache__`, `.pytest_cache` 아래의 변경.
-  이 폴더들은 fingerprint와 검토 diff에 들어가지 않지만, Python은 `-B`에서도 캐시된
+- 허용 경로 안이라도 `.harness`, `.venv`, `__pycache__` 아래의 변경과 아래에 적은 `.git` 보호 파일의
+  변경. 이 폴더들은 fingerprint와 검토 diff에 들어가지 않지만, Python은 `-B`에서도 캐시된
   bytecode를 읽으므로 실제로 실행되는 코드를 바꿀 수 있다.
 
+IDE·파일 관리자·테스트 도구가 호출 중에 바꾸는 다음 파일은 실행되는 코드나 검증 대상을 바꾸지 못한다.
+그래서 중단하지 않고 단계 기록의 `ignored_changes`(최대 20개)와 `ignored_change_count`로 보고하며,
+구현 진행으로도 세지 않는다. 링크로 바뀐 경우는 예외 없이 위 규칙을 따른다.
+
+- `.git` 안의 파일(index, refs, objects, FETCH_HEAD 등). 단 hooks, config, config.worktree,
+  info/attributes는 git이 실행할 명령을 정하므로 하위 모듈·worktree의 같은 파일까지 계속 중단한다.
+  `.git` 항목 자체(gitdir를 가리키는 파일 포함)를 바꾸는 것도 중단한다.
+- 데이터 캐시 `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.hypothesis`와 `.coverage`, `.coverage.*`.
+  검사 명령은 이 캐시에 따라 실행할 테스트가 달라지는 옵션(pytest의 `--lf`, `--ff`, `--sw` 등)을
+  쓰지 않아야 한다.
+- OS 메타데이터 `.DS_Store`, `Thumbs.db`, `desktop.ini`. 증거 폴더 비교에서도 이 세 이름은 무시한다.
+
+새 폴더를 만드는 것은 그 안에 캐시만 있어도 일반 변경으로 판정한다.
 허용 경로 밖의 변경은 이 검사가 막으므로 Claude 검토 diff는 추적 입력만 포함한다.
 
 비교는 파일을 스트리밍으로 SHA-256 해시한다. 같은 프로세스 안에서는 크기와 수정 시각이 그대로이고
@@ -311,4 +324,4 @@ Codex와 Claude 어댑터는 인자·표준 입력·구조화된 응답·오류 
 별도 재고 예제에서 실제 Claude 설계·검토와 Codex 구현 연결을 확인한다. 외부 모델을 사용하는 검사는 기본 테스트 실행에 포함하지 않는다.
 
 기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.5 범위에 포함하지 않는다.
-SIGHUP 처리, Windows 프로세스의 단계적 종료, 잠금 대기, 무해한 캐시·`.git` 변경의 별도 분류도 이번 범위가 아니다.
+SIGHUP 처리, Windows 프로세스의 단계적 종료, 잠금 대기도 이번 범위가 아니다.

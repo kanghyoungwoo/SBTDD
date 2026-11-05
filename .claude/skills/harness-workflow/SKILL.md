@@ -63,7 +63,7 @@ Harness has no resume operation; a new invocation starts with fresh verification
 | `passed` | Report the selected requirement, `project_status`, `review_status` and record path. A target pass can coexist with pre-existing unrelated failures. |
 | `agent_question` | Present the question with the specific conflicting requirement; apply the user's answer to the brief/contract only within their authorized scope. |
 | `red_not_observed`, `scaffold_not_red` | Compare expected, declared and observed Red IDs, per-check `stub_red_problems`, `check_diagnostics` and `verification_record`. Do not manufacture failing tests. |
-| `scope_changed`, `contract_changed` | Show `changed_files`; review the actual diff. Do not silently restore source or weaken the allowed scope. |
+| `scope_changed`, `contract_changed` | Show `changed_files`; review the actual diff. Do not silently restore source or weaken the allowed scope. Phase `ignored_changes` only lists benign `.git`, cache and OS metadata edits that did not stop the run. |
 | `evidence_changed` | Stop trusting history. Inspect `integrity_record`, changed evidence and preserved incident logs. Repair or quarantine affected records before removing the marker and rerunning checks. Never delete the marker just to continue. |
 | `interrupted` | Inspect changes and saved phase status before a fresh run. No automatic rollback or session resume is implied. |
 | `invalid_response` | One format-only repair has already been attempted. Inspect original logs and `repair/`; do not blindly repeat implementation. |

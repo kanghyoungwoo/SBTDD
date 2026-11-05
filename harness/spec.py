@@ -4,7 +4,7 @@ import re
 import sys
 import uuid
 
-from .agent import (AgentError, guarded_invoke, invoke_codex, red_details, require_providers,
+from .agent import (AgentError, guarded_invoke, ignored_details, invoke_codex, red_details, require_providers,
                     validate_response, verification_cli, write_json)
 from .guard import check_integrity, plain_path
 from .lock import project_lock
@@ -199,11 +199,11 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
         report["phases"].append(event)
         save()
         try:
-            raw, changed = guarded_invoke(draft, root, invoke, context, folder, timeout_seconds,
+            raw, changed, ignored = guarded_invoke(draft, root, invoke, context, folder, timeout_seconds,
                                           allowed=("src", "tests") if phase == "scaffold" else (),
                                           add_only=phase == "scaffold")
             response = validate(raw)
-            event["changed_files"] = changed
+            event.update(changed_files=changed, **ignored_details(ignored))
         except AgentError as error:
             event.update(status="error", reason=error.reason)
             raise

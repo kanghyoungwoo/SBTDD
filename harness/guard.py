@@ -92,6 +92,33 @@ def changed_paths(before, after):
     return sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
 
 
+# Other programs rewrite these while an AI call runs: an IDE's `git status` refreshes .git/index,
+# a file manager writes folder metadata, test tools update data caches. None of them changes which
+# code runs or what the harness verifies, so they are reported instead of stopping the run.
+OS_METADATA = {'.DS_Store', 'Thumbs.db', 'desktop.ini'}
+TOOL_CACHES = {'.pytest_cache', '.mypy_cache', '.ruff_cache', '.hypothesis'}
+
+
+def is_os_metadata(name):
+    return name.rsplit('/', 1)[-1] in OS_METADATA
+
+
+def is_benign_change(name):
+    parts = name.split('/')
+    last = parts[-1]
+    if last in OS_METADATA or last == '.coverage' or last.startswith('.coverage.'):
+        return True
+    if TOOL_CACHES.intersection(parts):
+        return True
+    if '.git' in parts:
+        inside = parts[parts.index('.git') + 1:]
+        # Hooks, configuration (hooksPath, fsmonitor, filters) and attributes decide which commands
+        # git runs. Submodule and worktree git directories nest the same files, so match at any depth.
+        return (bool(inside) and 'hooks' not in inside and inside[-1] not in ('config', 'config.worktree')
+                and inside[-2:] != ['info', 'attributes'])
+    return False
+
+
 def mark_integrity_violation(evidence, changed):
     path = evidence / INTEGRITY_MARKER
     plain_path(path)

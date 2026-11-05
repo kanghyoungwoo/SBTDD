@@ -11,7 +11,8 @@ import time
 import uuid
 
 from .core import EXCLUDED, HarnessError, fields, fingerprint, input_files, is_text, require, status_from_latest
-from .guard import changed_paths, check_integrity, mark_integrity_violation, plain_path, tree_snapshot
+from .guard import (changed_paths, check_integrity, is_benign_change, is_os_metadata, mark_integrity_violation,
+                    plain_path, tree_snapshot)
 from .lock import TOKEN_VARIABLE, environment, held_token, project_lock
 from .processes import interrupt_on_term, run_command, terminate_tree
 
@@ -197,7 +198,7 @@ def parse_with_repair(root, output, parse, repair, directory, schema):
     try:
         repaired = repair(prompt, folder)
     finally:
-        changed = changed_paths(before, snapshot(root))
+        changed, _ = split_changes(before, snapshot(root))
         if changed:
             raise AgentError("scope_changed", "Response repair must not modify project files.",
                              status="needs_input", changed_files=changed)
@@ -238,6 +239,19 @@ def snapshot(root):
     return tree_snapshot(root, excluded=[root / ".harness"])
 
 
+def split_changes(before, after):
+    """Separate changes the scope check judges from benign ones it only reports."""
+    changed, ignored = [], []
+    for name in changed_paths(before, after):
+        benign = is_benign_change(name) and not after.get(name, "").startswith("link:")
+        (ignored if benign else changed).append(name)
+    return changed, ignored
+
+
+def ignored_details(ignored):
+    return {"ignored_changes": ignored[:20], "ignored_change_count": len(ignored)} if ignored else {}
+
+
 def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, allowed=(), add_only=False):
     """Keep provider artifacts separate while checking workspace and evidence changes."""
     evidence = evidence_root / ".harness"
@@ -260,8 +274,9 @@ def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, all
             response = invoke(root, context, staging, timeout)
         finally:
             after = snapshot(root)
-            changed = changed_paths(before, after)
-            evidence_changes = changed_paths(evidence_before, evidence_snapshot())
+            changed, ignored = split_changes(before, after)
+            evidence_changes = [name for name in changed_paths(evidence_before, evidence_snapshot())
+                                if not is_os_metadata(name)]
             if evidence_changes:
                 incident = evidence / "incidents" / uuid.uuid4().hex
                 copy_artifacts(staging, incident)
@@ -285,7 +300,7 @@ def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, all
             if forbidden:
                 raise AgentError("scope_changed", "Changes exceeded the allowed paths for " + context["phase"] + ".",
                                  status="needs_input", changed_files=forbidden)
-        return response, changed
+        return response, changed, ignored
     finally:
         shutil.rmtree(staging)
 
@@ -395,7 +410,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
             report["review_status"] = "unverified"
         save()
         try:
-            raw, changed = guarded_invoke(root, root, invoke_codex, context, call_directory, timeout_seconds,
+            raw, changed, ignored = guarded_invoke(root, root, invoke_codex, context, call_directory, timeout_seconds,
                                           manifest["agent"]["test_paths" if phase == "tests" else "code_paths"],
                                           add_only=phase == "tests")
             response = validate_response(raw)
@@ -404,7 +419,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
             if error.reason in ("scope_changed", "contract_changed", "evidence_changed"):
                 report["project_status"] = "stale"
             raise
-        event.update(status="completed", response=response, changed_files=changed)
+        event.update(status="completed", response=response, changed_files=changed, **ignored_details(ignored))
         save()
         if response["outcome"] == "needs_input":
             raise AgentError("agent_question", response["summary"], status="needs_input", question=response["question"])
@@ -432,14 +447,14 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
         save()
         try:
             validate = validate_design if phase == "design" else validate_review
-            raw, changed = guarded_invoke(root, root, invoke_claude, context, call_directory, timeout_seconds)
+            raw, changed, ignored = guarded_invoke(root, root, invoke_claude, context, call_directory, timeout_seconds)
             response = validate(raw)
         except AgentError as error:
             event.update(status="error", reason=error.reason, message=str(error), **error.details)
             if error.reason in ("scope_changed", "contract_changed", "evidence_changed"):
                 report["project_status"] = "stale"
             raise
-        event.update(status="completed", response=response, changed_files=changed)
+        event.update(status="completed", response=response, changed_files=changed, **ignored_details(ignored))
         save()
         if fingerprint(root, manifest) != expected:
             report["project_status"] = "stale"

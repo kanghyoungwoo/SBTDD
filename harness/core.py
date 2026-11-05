@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 
-from .guard import changed_paths, check_integrity, mark_integrity_violation, plain_path, tree_snapshot
+from .guard import changed_paths, check_integrity, is_os_metadata, mark_integrity_violation, plain_path, tree_snapshot
 from .lock import environment, project_lock
 from .processes import interrupt_on_term, run_command
 
@@ -219,7 +219,8 @@ def record_checks(root, manifest, before, requirement):
                                 "exit_code": None, "stdout": "", "stderr": "Execution interrupted.",
                                 "reason": "interrupted", "duration_seconds": 0})
             break
-    evidence_changes = changed_paths(evidence_before, tree_snapshot(evidence))
+    evidence_changes = [name for name in changed_paths(evidence_before, tree_snapshot(evidence))
+                        if not is_os_metadata(name)]
     if evidence_changes:
         mark_integrity_violation(evidence, evidence_changes)
     snapshot_error = None
