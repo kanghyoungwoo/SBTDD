@@ -68,12 +68,61 @@ def main(
     sub = parser.add_subparsers(dest="command", required=True)
     imp = sub.add_parser("import-data")
     imp.add_argument("--file", required=True)
-    for name in ("backtest", "run", "status", "adjust"):
-        sub.add_parser(name)
+    bt = sub.add_parser("backtest")
+    bt.add_argument("--rules", required=True)
+    sub.add_parser("run")
+    sub.add_parser("status")
+    adj = sub.add_parser("adjust")
+    adj.add_argument("--shares")
+    adj.add_argument("--reason")
     try:
         args, _extra = parser.parse_known_args(argv)
     except SystemExit:
         return 2
+
+    if args.command in ("run", "backtest"):
+        store = None
+        try:
+            config = load_config(args.config)
+            if args.command == "backtest":
+                _validate_backtest_config(config)
+            db = _cfg_get(config.raw, "paths.database")
+            if not isinstance(db, str) or not db:
+                raise ConfigError("paths.database is required")
+        except ConfigError as exc:
+            err.write(f"error: {exc}\n")
+            if args.command == "run" and notifier is not None:
+                _safe_send(notifier, Notification(
+                    kind="ERROR", trade_date=None, reason="CONFIG_ERROR",
+                    text=str(exc)))
+            return 2
+        try:
+            try:
+                store = Store.open(db)
+            except (RuntimeError, sqlite3.Error) as exc:
+                err.write(f"error: {exc}\n")
+                return 2
+            if args.command == "backtest":
+                result = run_backtest(store, args.rules, config)
+                out.write(json.dumps(result, default=str) + "\n")
+                return 0
+
+            class _NoopNotifier:
+                def send(self, notification):
+                    pass
+
+            res = run_once(
+                config, store, broker=broker,
+                notifier=notifier if notifier is not None else _NoopNotifier(),
+                now=now or dt.datetime.now(dt.timezone.utc),
+                tz_loader=tz_loader)
+            out.write(json.dumps({"exit_code": res.exit_code,
+                                  "reasons": res.reasons,
+                                  "orders_sent": res.orders_sent}) + "\n")
+            return res.exit_code
+        finally:
+            if store is not None:
+                store.close()
 
     if args.command != "import-data":
         raise NotImplementedError("main")
@@ -99,6 +148,129 @@ def main(
     finally:
         if store is not None:
             store.close()
+
+
+def _cfg_get(raw: dict, key: str):
+    node = raw
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            raise ConfigError(f"{key} is required")
+        node = node[part]
+    return node
+
+
+def _cfg_num(raw, key, *, gt=None, ge=None, le=None) -> Decimal:
+    v = _cfg_get(raw, key)
+    if isinstance(v, bool) or not isinstance(v, (int, Decimal)):
+        raise ConfigError(f"{key} must be a number")
+    d = Decimal(v)
+    if not d.is_finite():
+        raise ConfigError(f"{key} must be finite")
+    if gt is not None and not d > gt:
+        raise ConfigError(f"{key} must be > {gt}")
+    if ge is not None and not d >= ge:
+        raise ConfigError(f"{key} must be >= {ge}")
+    if le is not None and not d <= le:
+        raise ConfigError(f"{key} must be <= {le}")
+    return d
+
+
+def _cfg_int(raw, key, *, ge=None, le=None) -> int:
+    v = _cfg_get(raw, key)
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ConfigError(f"{key} must be an integer")
+    if ge is not None and v < ge:
+        raise ConfigError(f"{key} must be >= {ge}")
+    if le is not None and v > le:
+        raise ConfigError(f"{key} must be <= {le}")
+    return v
+
+
+def _cfg_bool(raw, key) -> bool:
+    v = _cfg_get(raw, key)
+    if not isinstance(v, bool):
+        raise ConfigError(f"{key} must be a boolean")
+    return v
+
+
+def _cfg_enum(raw, key, allowed) -> str:
+    v = _cfg_get(raw, key)
+    if not isinstance(v, str) or v not in allowed:
+        raise ConfigError(f"{key} must be one of {sorted(allowed)}")
+    return v
+
+
+def _cfg_hhmm(raw, key) -> dt.time:
+    v = _cfg_get(raw, key)
+    if not isinstance(v, str):
+        raise ConfigError(f"{key} must be HH:MM")
+    try:
+        return dt.datetime.strptime(v, "%H:%M").time()
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be HH:MM") from exc
+
+
+def _validate_deposit_schedule(raw) -> None:
+    cycle = _cfg_enum(raw, "deposit.cycle", {"monthly", "every_n_trading_days"})
+    if cycle == "monthly":
+        _cfg_int(raw, "deposit.day", ge=1, le=31)
+    else:
+        _cfg_int(raw, "deposit.n", ge=1)
+
+
+def _validate_run_config(config: Config) -> None:
+    raw = config.raw
+    if config.stage not in ("dry-run", "paper", "live"):
+        raise ConfigError("stage must be one of dry-run, paper, live")
+    if not isinstance(_cfg_get(raw, "paths.halt_file"), str):
+        raise ConfigError("paths.halt_file must be a string")
+    _cfg_num(raw, "limits.per_order_usd", gt=0)
+    _cfg_num(raw, "limits.monthly_usd", gt=0)
+    _cfg_num(raw, "costs.buy_fee_pct", ge=0, le=100)
+    start = _cfg_hhmm(raw, "order_window.start")
+    end = _cfg_hhmm(raw, "order_window.end")
+    if not start < end:
+        raise ConfigError("order_window.start must be before order_window.end")
+    _cfg_num(raw, "order.limit_margin_pct", ge=0)
+    _cfg_num(raw, "guard.abnormal_price_pct", gt=0)
+    _cfg_bool(raw, "shares.fractional")
+    rule_type = "baseline"
+    if "operating_rule" in raw:
+        rule_type = _cfg_enum(raw, "operating_rule.type",
+                              {"baseline", "close_at_or_below"})
+        if rule_type == "close_at_or_below":
+            _cfg_num(raw, "operating_rule.threshold_usd", gt=0)
+    if rule_type == "baseline":
+        _validate_deposit_schedule(raw)
+        if _cfg_get(raw, "deposit.cycle") == "every_n_trading_days":
+            v = _cfg_get(raw, "deposit.anchor_date")
+            try:
+                dt.date.fromisoformat(v if isinstance(v, str) else str(v))
+            except ValueError as exc:
+                raise ConfigError("deposit.anchor_date must be a date") from exc
+
+
+def _validate_backtest_config(config: Config) -> None:
+    raw = config.raw
+    _validate_deposit_schedule(raw)
+    _cfg_num(raw, "deposit.amount", gt=0)
+    _cfg_enum(raw, "deposit.currency", {"KRW", "USD"})
+    for key in ("costs.buy_fee_pct", "costs.fx_cost_pct",
+                "costs.dividend_withholding_pct"):
+        _cfg_num(raw, key, ge=0, le=100)
+    _cfg_num(raw, "order.limit_margin_pct", ge=0)
+    _cfg_bool(raw, "shares.fractional")
+    _cfg_int(raw, "adoption.holdout_years", ge=1)
+    _cfg_int(raw, "adoption.rolling_window_years", ge=1)
+    _cfg_num(raw, "adoption.min_outperformance_pct", ge=0)
+    _cfg_num(raw, "adoption.min_rolling_ratio_pct", ge=0, le=100)
+
+
+def _safe_send(notifier, notification: Notification) -> None:
+    try:
+        notifier.send(notification)
+    except Exception:
+        pass
 
 
 def load_config(path) -> Config:
@@ -467,6 +639,22 @@ def run_once(
     now: dt.datetime,
     tz_loader: Callable[[str], dt.tzinfo] = zoneinfo.ZoneInfo,
 ) -> RunResult:
+    try:
+        tz = tz_loader("America/New_York")
+    except Exception:
+        _safe_send(notifier, Notification(
+            kind="ERROR", trade_date=None, reason="TIMEZONE_UNAVAILABLE",
+            text="America/New_York timezone is unavailable"))
+        return RunResult(exit_code=2, reasons=["TIMEZONE_UNAVAILABLE"],
+                         orders_sent=0)
+    ny_date = now.astimezone(tz).date()
+    try:
+        _validate_run_config(config)
+    except ConfigError as exc:
+        _safe_send(notifier, Notification(
+            kind="ERROR", trade_date=ny_date, reason="CONFIG_ERROR",
+            text=str(exc)))
+        return RunResult(exit_code=2, reasons=["CONFIG_ERROR"], orders_sent=0)
     raise NotImplementedError("run_once")
 
 
@@ -519,4 +707,6 @@ class FakeNotifier:
         self.messages: list[Notification] = []
 
     def send(self, notification: Notification) -> None:
-        raise NotImplementedError("FakeNotifier.send")
+        if self.fail:
+            raise RuntimeError("notifier failure")
+        self.messages.append(notification)
