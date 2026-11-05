@@ -103,7 +103,12 @@ def main(
                 err.write(f"error: {exc}\n")
                 return 2
             if args.command == "backtest":
-                result = run_backtest(store, args.rules, config)
+                try:
+                    result = run_backtest(store, args.rules, config)
+                except (ConfigError, DataImportError, ValueError,
+                        OSError) as exc:
+                    err.write(f"error: {exc}\n")
+                    return 2
                 out.write(json.dumps(result, default=str) + "\n")
                 return 0
 
@@ -752,11 +757,186 @@ def evaluate_adoption(
     min_outperformance_pct: Decimal,
     min_rolling_ratio_pct: Decimal,
 ) -> AdoptionResult:
-    raise NotImplementedError("evaluate_adoption")
+    hundred = Decimal(100)
+    if baseline_eval_shares != 0:
+        outperf = ((rule_eval_shares - baseline_eval_shares)
+                   / baseline_eval_shares * hundred)
+    else:
+        outperf = None
+    if rolling_pairs:
+        ok = sum(1 for r, b in rolling_pairs if r >= b)
+        ratio = Decimal(ok) / Decimal(len(rolling_pairs)) * hundred
+    else:
+        ratio = Decimal(0)
+    if baseline_eval_shares == 0:
+        outperf_ok = rule_eval_shares > 0
+    else:
+        outperf_ok = (rule_eval_shares > baseline_eval_shares
+                      and outperf >= min_outperformance_pct)
+    adopted = bool(outperf_ok and ratio >= min_rolling_ratio_pct)
+    return AdoptionResult(adopted=adopted, outperformance_pct=outperf,
+                          rolling_ratio_pct=ratio)
+
+
+def _load_rules(path) -> list[Rule]:
+    import json
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh, parse_float=Decimal)
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"cannot read rules: {exc}") from exc
+    if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
+        raise ConfigError("rules file must contain a 'rules' list")
+    rules: list[Rule] = []
+    seen: set[str] = set()
+    for item in doc["rules"]:
+        if not isinstance(item, dict):
+            raise ConfigError("rule must be an object")
+        rid = item.get("id")
+        if not isinstance(rid, str) or not rid or rid == "baseline" \
+                or rid in seen:
+            raise ConfigError(f"invalid or duplicate rule id: {rid!r}")
+        seen.add(rid)
+        if item.get("type") != "close_at_or_below":
+            raise ConfigError(f"unknown rule type: {item.get('type')!r}")
+        th = item.get("threshold_usd")
+        if isinstance(th, bool) or not isinstance(th, (str, int, Decimal)):
+            raise ConfigError("threshold_usd must be a number")
+        try:
+            thd = Decimal(th)
+        except Exception as exc:
+            raise ConfigError("threshold_usd must be a number") from exc
+        if not thd.is_finite() or not thd > 0:
+            raise ConfigError("threshold_usd must be positive")
+        rules.append(Rule(rid, "close_at_or_below", thd))
+    return rules
+
+
+def _add_years(d: dt.date, n: int) -> dt.date:
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:
+        return d.replace(year=d.year + n, day=28)
+
+
+def _backtest_settings(raw: dict) -> BacktestSettings:
+    cycle = _cfg_get(raw, "deposit.cycle")
+    return BacktestSettings(
+        deposit_cycle=cycle,
+        deposit_day=(_cfg_int(raw, "deposit.day") if cycle == "monthly" else 1),
+        deposit_n=(_cfg_int(raw, "deposit.n")
+                   if cycle == "every_n_trading_days" else 1),
+        deposit_amount=_cfg_num(raw, "deposit.amount"),
+        currency=_cfg_get(raw, "deposit.currency"),
+        buy_fee_pct=_cfg_num(raw, "costs.buy_fee_pct"),
+        fx_cost_pct=_cfg_num(raw, "costs.fx_cost_pct"),
+        withholding_pct=_cfg_num(raw, "costs.dividend_withholding_pct"),
+        limit_margin_pct=_cfg_num(raw, "order.limit_margin_pct"),
+        fractional=_cfg_bool(raw, "shares.fractional"),
+    )
+
+
+def _load_fx(store: Store) -> dict[dt.date, Decimal]:
+    rows = store._conn.execute("SELECT date, usd_krw FROM fx_rates").fetchall()
+    return {dt.date.fromisoformat(d): Decimal(v) for d, v in rows}
+
+
+def _metrics_dict(m: RuleMetrics) -> dict:
+    out = {}
+    for k, v in m.__dict__.items():
+        out[k] = str(v) if isinstance(v, Decimal) else v
+    return out
 
 
 def run_backtest(store: Store, rules_path, config: Config) -> dict:
-    raise NotImplementedError("run_backtest")
+    raw = config.raw
+    rules = _load_rules(rules_path)
+    settings = _backtest_settings(raw)
+    holdout = _cfg_int(raw, "adoption.holdout_years")
+    window_years = _cfg_int(raw, "adoption.rolling_window_years")
+    min_out = _cfg_num(raw, "adoption.min_outperformance_pct")
+    min_ratio = _cfg_num(raw, "adoption.min_rolling_ratio_pct")
+
+    bars = store.list_bars()
+    if not bars:
+        raise ConfigError("no bars imported")
+    fx = _load_fx(store)
+    one_day = dt.timedelta(days=1)
+    last = bars[-1].date
+    cut = _add_years(last, -holdout)
+    tuning = [b for b in bars if b.date <= cut]
+    evaluation = [b for b in bars if b.date > cut]
+    if not tuning or not evaluation:
+        raise ConfigError("holdout split leaves an empty segment")
+
+    seg_out = {}
+    sims = {}
+    for name, seg, start, end in (
+            ("tuning", tuning, tuning[0].date.isoformat(), cut.isoformat()),
+            ("evaluation", evaluation, (cut + one_day).isoformat(),
+             last.isoformat())):
+        sim = simulate(seg, rules, settings, fx)
+        sims[name] = sim
+        seg_out[name] = {
+            "start": start, "end": end,
+            "rules": {rid: _metrics_dict(m) for rid, m in sim.metrics.items()},
+        }
+
+    pairs: dict[str, list[tuple[Decimal, Decimal]]] = {r.id: [] for r in rules}
+    seen_months: set[tuple[int, int]] = set()
+    for b in bars:
+        key = (b.date.year, b.date.month)
+        if key in seen_months:
+            continue
+        seen_months.add(key)
+        bound = _add_years(b.date, window_years) - one_day
+        if bound > last:
+            continue
+        window = [x for x in bars if b.date <= x.date <= bound]
+        res = simulate(window, rules, settings, fx)
+        base = res.metrics["baseline"].final_shares
+        for r in rules:
+            pairs[r.id].append((res.metrics[r.id].final_shares, base))
+    if not any(pairs.values()) and rules:
+        raise ConfigError("no complete rolling windows")
+
+    rolling = {}
+    adoption = {}
+    selected = "baseline"
+    best = None
+    ev = sims["evaluation"].metrics
+    base_ev = ev["baseline"].final_shares
+    for r in rules:
+        ps = pairs[r.id]
+        res = evaluate_adoption(ev[r.id].final_shares, base_ev, ps,
+                                min_out, min_ratio)
+        rolling[r.id] = {
+            "windows": len(ps),
+            "at_or_above_baseline": sum(1 for a, c in ps if a >= c),
+            "ratio_pct": str(res.rolling_ratio_pct),
+        }
+        adoption[r.id] = {
+            "adopted": res.adopted,
+            "outperformance_pct": (None if res.outperformance_pct is None
+                                   else str(res.outperformance_pct)),
+            "rolling_ratio_pct": str(res.rolling_ratio_pct),
+        }
+        if res.adopted and (best is None or ev[r.id].final_shares > best):
+            best = ev[r.id].final_shares
+            selected = r.id
+
+    return {
+        "segments": seg_out,
+        "rolling": rolling,
+        "adoption": adoption,
+        "selected_rule": selected,
+        "data": {
+            "bars_sha256": store.snapshot_sha256("bars"),
+            "calendar_sha256": store.snapshot_sha256("calendar"),
+            "fx_sha256": store.snapshot_sha256("fx"),
+        },
+    }
 
 
 def compute_order(
