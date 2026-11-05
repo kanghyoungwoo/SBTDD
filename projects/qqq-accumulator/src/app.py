@@ -590,7 +590,159 @@ def simulate(
     settings: BacktestSettings,
     fx_rates: dict[dt.date, Decimal] | None = None,
 ) -> SimulationResult:
-    raise NotImplementedError("simulate")
+    from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_HALF_UP
+
+    def q(value: Decimal, exp: str, mode) -> Decimal:
+        return value.quantize(Decimal(exp), rounding=mode)
+
+    def qty_round(value: Decimal) -> Decimal:
+        if settings.fractional:
+            return q(value, "0.000001", ROUND_DOWN)
+        return q(value, "1", ROUND_DOWN)
+
+    if not bars:
+        raise ValueError("bars must not be empty")
+    hundred = Decimal(100)
+    one = Decimal(1)
+    zero = Decimal(0)
+
+    # deposit days
+    deposit_days: set[int] = set()
+    if settings.deposit_cycle == "every_n_trading_days":
+        n = max(int(settings.deposit_n), 1)
+        deposit_days = set(range(0, len(bars), n))
+    elif settings.deposit_cycle == "monthly":
+        months: dict[tuple[int, int], list[int]] = {}
+        for i, b in enumerate(bars):
+            months.setdefault((b.date.year, b.date.month), []).append(i)
+        for idxs in months.values():
+            chosen = idxs[-1]
+            for i in idxs:
+                if bars[i].date.day >= settings.deposit_day:
+                    chosen = i
+                    break
+            deposit_days.add(chosen)
+    else:
+        raise ValueError(f"unknown deposit_cycle: {settings.deposit_cycle}")
+
+    all_rules = [Rule("baseline", "baseline")] + list(rules)
+    for r in all_rules[1:]:
+        if r.type not in ("baseline", "close_at_or_below"):
+            raise ValueError(f"unknown rule type: {r.type}")
+
+    def decide(rule: Rule, bar: Bar, available: Decimal, is_deposit: bool):
+        if rule.type == "baseline":
+            return available if is_deposit else zero
+        if rule.type == "close_at_or_below":
+            if (rule.threshold_usd is not None and bar.close <=
+                    rule.threshold_usd and available > 0):
+                return available
+            return zero
+        raise ValueError(f"unknown rule type: {rule.type}")
+
+    states = {}
+    for r in all_rules:
+        states[r.id] = {
+            "shares": zero, "cash": zero, "reserved": zero, "pending": None,
+            "deposit": zero, "cost": zero, "unfilled": 0, "waiting": 0,
+        }
+    decisions: list[Decision] = []
+
+    for idx, bar in enumerate(bars):
+        is_deposit = idx in deposit_days
+        deposit_usd = zero
+        if is_deposit:
+            if settings.currency == "KRW":
+                rate = (fx_rates or {}).get(bar.date)
+                if rate is None:
+                    raise DataImportError(f"missing fx rate for {bar.date}")
+                deposit_usd = q(
+                    settings.deposit_amount / rate
+                    * (one - settings.fx_cost_pct / hundred),
+                    "0.01", ROUND_DOWN)
+            else:
+                deposit_usd = settings.deposit_amount
+        for r in all_rules:
+            st = states[r.id]
+            # 1. split
+            if bar.split_factor != 1:
+                f = bar.split_factor
+                st["shares"] = st["shares"] * f
+                if not settings.fractional:
+                    st["shares"] = q(st["shares"], "1", ROUND_DOWN)
+                if st["pending"] is not None:
+                    pq, pl = st["pending"]
+                    pq = pq * f
+                    if not settings.fractional:
+                        pq = q(pq, "1", ROUND_DOWN)
+                    st["pending"] = (pq, pl / f)
+            # 2. settle
+            if st["pending"] is not None:
+                pq, pl = st["pending"]
+                if bar.close <= pl:
+                    cost = q(pq * bar.close, "0.01", ROUND_HALF_UP)
+                    fee = q(cost * settings.buy_fee_pct / hundred, "0.01",
+                            ROUND_CEILING)
+                    st["cash"] -= cost + fee
+                    st["cost"] += cost + fee
+                    st["shares"] += pq
+                else:
+                    st["unfilled"] += 1
+                st["pending"] = None
+                st["reserved"] = zero
+            # 3. dividend
+            if bar.dividend > 0 and st["shares"] > 0:
+                st["cash"] += q(
+                    st["shares"] * bar.dividend
+                    * (one - settings.withholding_pct / hundred),
+                    "0.01", ROUND_DOWN)
+            # 4. deposit
+            if is_deposit:
+                st["cash"] += deposit_usd
+                st["deposit"] += deposit_usd
+            # 6. decide
+            available = st["cash"] - st["reserved"]
+            amount = decide(r, bar, available, is_deposit)
+            if amount > 0:
+                limit = q(bar.close * (one + settings.limit_margin_pct
+                                       / hundred), "0.01", ROUND_HALF_UP)
+                qty = qty_round(
+                    amount / (limit * (one + settings.buy_fee_pct / hundred)))
+                if qty > 0:
+                    decisions.append(Decision(bar.date, r.id, qty, limit))
+                    st["pending"] = (qty, limit)
+                    st["reserved"] = amount
+            # 7. waiting
+            if st["cash"] - st["reserved"] > 0:
+                st["waiting"] += 1
+
+    last_close = bars[-1].close
+    raw = {}
+    for r in all_rules:
+        st = states[r.id]
+        eq = q(st["shares"] + st["cash"] / last_close, "0.000001",
+               ROUND_DOWN)
+        avg = (q(st["cost"] / st["shares"], "0.0001", ROUND_HALF_UP)
+               if st["shares"] > 0 else None)
+        raw[r.id] = (st, eq, avg)
+    base_shares = states["baseline"]["shares"]
+    base_eq = raw["baseline"][1]
+    metrics = {}
+    for r in all_rules:
+        st, eq, avg = raw[r.id]
+        metrics[r.id] = RuleMetrics(
+            final_shares=st["shares"],
+            cash_usd=st["cash"],
+            equivalent_shares=eq,
+            total_deposit_usd=st["deposit"],
+            average_cost_usd=avg,
+            cash_waiting_days=st["waiting"],
+            unfilled_count=st["unfilled"],
+            final_shares_diff_vs_baseline=st["shares"] - base_shares,
+            equivalent_shares_diff_vs_baseline=eq - base_eq,
+        )
+    decisions.sort(key=lambda d: d.date)
+    return SimulationResult(metrics=metrics, decisions=decisions)
 
 
 def evaluate_adoption(
