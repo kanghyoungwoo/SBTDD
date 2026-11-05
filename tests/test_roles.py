@@ -35,7 +35,8 @@ class RoleWorkflowTests(unittest.TestCase):
         def default_claude(root, context, directory, timeout):
             return design() if context["phase"] == "design" else review()
         with patch("harness.agent.invoke_codex", side_effect=codex or self.fix) as implementation, \
-                patch("harness.claude.invoke_claude", side_effect=claude or default_claude) as reviewer:
+                patch("harness.claude.invoke_claude", side_effect=claude or default_claude) as reviewer, \
+                patch("harness.agent.require_providers"):
             result = run_agent(self.root, self.manifest, **kwargs)
         self.assertEqual(json.loads((self.root / result["record"]).read_text(encoding="utf-8")), result)
         return result, implementation, reviewer
@@ -229,6 +230,15 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertNotIn("--continue", command)
         self.assertIn("REQ-1", process.communicate.call_args.kwargs["input"])
         self.assertEqual(json.loads((self.directory / "response.json").read_text(encoding="utf-8")), design())
+
+    def test_review_rules_require_complete_findings_and_scoped_stub_checks(self):
+        _, process, _ = self.invoke({"type": "result", "subtype": "success", "is_error": False,
+                                     "structured_output": design()})
+        prompt = process.communicate.call_args.kwargs["input"]
+        self.assertIn("List every blocking issue you find in this round", prompt)
+        self.assertIn("NotImplementedError on the behavior the selected", prompt)
+        self.assertIn("Stubs that only serve other\nrequirements are expected", prompt)
+        self.assertIn("Do not state anything you did not verify", prompt)
 
     def test_missing_or_failed_structured_output_is_not_accepted(self):
         for payload in ({"type": "result", "subtype": "success", "is_error": False, "result": "approved"},

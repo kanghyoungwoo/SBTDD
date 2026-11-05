@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdd-bdd-tdd-harness"
-version = "0.4.0"
+version = "0.5.0"
 description = "Trace requirements, business scenarios, and test evidence."
 requires-python = ">=3.11"
 dependencies = []

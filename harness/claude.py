@@ -54,9 +54,15 @@ failures are reported separately. The design is a proposal, not authority over t
 Approve when there are no actionable correctness, requirement, regression or test-integrity
 issues. Do not block approval for optional stylistic preferences or speculative enhancements.
 For changes_requested, give concrete findings with project-relative path, issue and change.
+List every blocking issue you find in this round; do not hold findings back for a later round.
+Stubs, placeholders, TODO markers or NotImplementedError on the behavior the selected
+requirement's scenarios exercise are not an implementation. Stubs that only serve other
+requirements are expected in a project developed one requirement at a time; leave them alone.
 Request only changes within code_paths. If tests, protected files, specification or scope need
 to change, return needs_input with a precise question. Never relax tests to obtain a pass.
 If required evidence cannot be read, return needs_input; do not guess or approve incomplete work.
+Do not state anything you did not verify. In summary and findings, separate what you read in
+the files or evidence from what you infer, and never claim that commands or checks ran.
 Return schema-valid JSON. Approved reviews must have no findings. Keep question empty unless
 outcome/verdict is needs_input. Every invocation starts fresh; do not rely on earlier sessions.
 """

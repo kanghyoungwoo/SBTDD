@@ -43,8 +43,8 @@ class HarnessTests(unittest.TestCase):
             json.dumps(self.manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def cli(self, *args, expected=0):
-        env = dict(os.environ, PYTHONPATH=str(REPO), PYTHONIOENCODING="utf-8")
+    def cli(self, *args, expected=0, env=None):
+        env = dict(os.environ, PYTHONPATH=str(REPO), PYTHONIOENCODING="utf-8", **(env or {}))
         result = subprocess.run(
             [sys.executable, "-B", "-m", "harness", "--root", str(self.root), *args],
             cwd=REPO, env=env, capture_output=True, text=True, encoding="utf-8",
@@ -222,6 +222,19 @@ class HarnessTests(unittest.TestCase):
     def test_malformed_json(self):
         (self.root / "harness.json").write_text("{broken", encoding="utf-8")
         self.assertIn("harness.json", self.cli("check", expected=2)["error"])
+
+    def test_every_repository_test_is_linked_to_a_check(self):
+        manifest = json.loads((REPO / "harness.json").read_text(encoding="utf-8"))
+        names = [part for check in manifest["checks"] for part in check["command"] if part.startswith("tests.")]
+
+        def test_ids(suite):
+            for item in suite:
+                yield from test_ids(item) if isinstance(item, unittest.TestSuite) else [item.id()]
+
+        suite = unittest.defaultTestLoader.discover(str(REPO / "tests"), top_level_dir=str(REPO))
+        unlinked = [test_id for test_id in test_ids(suite)
+                    if not any(test_id == name or test_id.startswith(name + ".") for name in names)]
+        self.assertEqual(unlinked, [], "Link these tests to a check in harness.json")
 
 
 if __name__ == "__main__":

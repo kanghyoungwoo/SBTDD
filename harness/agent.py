@@ -10,8 +10,9 @@ import tempfile
 import time
 import uuid
 
-from .core import HarnessError, fields, fingerprint, input_files, is_text, require, status_from_latest
+from .core import EXCLUDED, HarnessError, fields, fingerprint, input_files, is_text, require, status_from_latest
 from .guard import changed_paths, check_integrity, mark_integrity_violation, plain_path, tree_snapshot
+from .lock import TOKEN_VARIABLE, environment, held_token, project_lock
 from .processes import interrupt_on_term, run_command, terminate_tree
 
 
@@ -41,6 +42,8 @@ In phase 'implement', change only code_paths. Preserve all tests. Implement the 
 then refactor only if needed and keep behavior covered. Fix any regressions your change causes.
 Use the supplied Claude design and review findings when present, within the existing contract.
 The harness will run the checks independently; your 'continue' response is not a pass verdict.
+In summary, report only what you changed and what you actually observed. Do not claim that
+checks pass or that behavior works unless you saw it, and say what you did not verify.
 Return schema-valid JSON. Use needs_input when a requirement or protected file must change.
 For tests/continue, red_check_ids must identify the relevant checks expected to fail.
 For implement/continue, red_check_ids can be empty. Keep question empty unless asking for input.
@@ -62,9 +65,13 @@ Do not use self.fail placeholders, skips, expectedFailure, subTest, mocks of the
 or artificial failures. Each test must reach the source stub and fail with NotImplementedError
 raised from src/. Do not use absolute paths or depend on this temporary project location.
 The harness runs one unittest discovery command per scenario and will independently check Red.
+In summary, report only the files you created and what you observed; do not claim unverified results.
 Return the standard JSON response. For continue, red_check_ids must include ALL check IDs.
 Use needs_input with a precise question if the contract or project environment is insufficient.
 """
+
+
+PROVIDER_LOGIN = {"codex": "codex login", "claude": "claude auth login"}
 
 
 class AgentError(HarnessError):
@@ -73,6 +80,15 @@ class AgentError(HarnessError):
         self.reason = reason
         self.status = status
         self.details = details
+
+
+def require_providers(names):
+    """Stop before baseline checks or paid model calls when a CLI the workflow needs is missing."""
+    missing = [name for name in names if shutil.which(name) is None]
+    if missing:
+        logins = " and ".join(f"'{PROVIDER_LOGIN[name]}'" for name in missing)
+        raise AgentError("agent_missing", f"AI CLI not on PATH: {', '.join(missing)}. Install it and run {logins}; "
+                         "'harness doctor' checks the local setup.", missing=missing)
 
 
 def write_json(path, value):
@@ -110,7 +126,7 @@ def run_process(root, command, prompt, directory, timeout, label):
         process = subprocess.Popen(
             command, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
-            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8"),
+            env=environment(PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8"),
             creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0,
         )
         try:
@@ -200,10 +216,12 @@ def verification_cli(root, manifest, *arguments):
     package_root = str(Path(__file__).resolve().parents[1])
     bootstrap = "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module('harness',run_name='__main__')"
     timeout = sum(check.get("timeout_seconds", 30) for check in manifest["checks"]) + 30
+    # Only the verifier started by the lock holder may run under that lock.
+    token = held_token(root)
     try:
         process = run_command(
             [sys.executable, "-I", "-B", "-c", bootstrap, package_root, "--root", str(root), *arguments], cwd=package_root,
-            env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+            env=environment(PYTHONIOENCODING="utf-8", **({TOKEN_VARIABLE: token} if token else {})),
             text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         value = json.loads(process.stdout)
@@ -257,8 +275,11 @@ def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, all
             if "harness.json" in changed and context["phase"] != "scaffold":
                 raise AgentError("contract_changed", "The project contract changed.", status="needs_input",
                                  changed_files=changed)
+            # Untracked caches and environments are not fingerprinted or reviewed, yet code there can
+            # still run (Python reads __pycache__ even with -B), so they stay protected inside scopes too.
             forbidden = [name for name in changed
                          if not any(Path(name).is_relative_to(Path(path)) for path in allowed)
+                         or EXCLUDED.intersection(Path(name).parts)
                          or add_only and name in before
                          or after.get(name, "").startswith("link:")]
             if forbidden:
@@ -319,6 +340,11 @@ def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
     require(requirement is None or any(r["id"] == requirement for r in manifest["requirements"]),
             f"Unknown requirement: {requirement}")
+    with project_lock(root, "agent"):
+        return develop(root, manifest, requirement, max_attempts, timeout_seconds)
+
+
+def develop(root, manifest, requirement, max_attempts, timeout_seconds):
     workflow = manifest["agent"].get("workflow", "codex")
     require(workflow in ("codex", "claude-codex"), "Unknown agent workflow")
     use_claude = workflow == "claude-codex"
@@ -436,6 +462,7 @@ def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=
     save()
     try:
         check_integrity(root)
+        require_providers(["claude", "codex"] if use_claude else ["codex"])
         verification_cli(root, manifest, "check")
         baseline = verify("baseline")
         state = current_state(manifest, baseline)

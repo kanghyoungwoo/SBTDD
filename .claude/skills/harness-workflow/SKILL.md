@@ -52,8 +52,9 @@ or log in on the user's behalf merely because doctor reports a problem.
 
 For Claude design and review the manifest uses `agent.workflow = "claude-codex"`. Respect
 `code_paths`, `test_paths` and the contract. Do not edit tests, evidence or commands to obtain
-a pass. Do not start simultaneous runs in the same project. Harness has no resume operation;
-a new invocation starts with fresh verification of the current files.
+a pass. Harness refuses a second `run`, `agent` or `init` in the same project with
+`project_locked`; wait for the first command and never delete `.harness/lock` to get past it.
+Harness has no resume operation; a new invocation starts with fresh verification of the current files.
 
 ## Read results and choose the next action
 
@@ -61,11 +62,13 @@ a new invocation starts with fresh verification of the current files.
 | --- | --- |
 | `passed` | Report the selected requirement, `project_status`, `review_status` and record path. A target pass can coexist with pre-existing unrelated failures. |
 | `agent_question` | Present the question with the specific conflicting requirement; apply the user's answer to the brief/contract only within their authorized scope. |
-| `red_not_observed`, `scaffold_not_red` | Compare expected, declared and observed Red IDs, `check_diagnostics` and `verification_record`. Do not manufacture failing tests. |
+| `red_not_observed`, `scaffold_not_red` | Compare expected, declared and observed Red IDs, per-check `stub_red_problems`, `check_diagnostics` and `verification_record`. Do not manufacture failing tests. |
 | `scope_changed`, `contract_changed` | Show `changed_files`; review the actual diff. Do not silently restore source or weaken the allowed scope. |
 | `evidence_changed` | Stop trusting history. Inspect `integrity_record`, changed evidence and preserved incident logs. Repair or quarantine affected records before removing the marker and rerunning checks. Never delete the marker just to continue. |
 | `interrupted` | Inspect changes and saved phase status before a fresh run. No automatic rollback or session resume is implied. |
 | `invalid_response` | One format-only repair has already been attempted. Inspect original logs and `repair/`; do not blindly repeat implementation. |
+| `agent_missing` | Name the `missing` CLIs and the login command; nothing ran yet. Do not install or log in for the user. |
+| `project_locked` | Another harness command owns the project (`lock_owner`). Wait or ask; do not delete lock files. |
 | `agent_exit`, `agent_timeout`, `verification_setup` | Read phase logs or the verification record, then use doctor for local setup issues. Do not loop on authentication, usage limits or timeouts. |
 | `no_progress`, `attempt_limit`, `review_rejected` | Explain remaining failed checks or actionable review findings; do not keep extending the attempt limit without addressing the cause. |
 

@@ -28,6 +28,7 @@ Harness는 세 가지 개발 방식을 연결해 이 확인 과정을 명시적�
 - 자연어 요구사항으로 빈 Python 프로젝트의 명세·BDD·API 뼈대·테스트 생성
 - Claude 설계 → Codex 테스트·구현 → CLI 검증 → Claude 검토 실행
 - 수정 범위와 증거 변경 감지, 제한된 구현 재시도, 중단 사유 기록
+- 같은 프로젝트에서 실행 기록을 쓰는 명령을 하나씩만 실행하는 운영체제 잠금
 - CLI·로그인·프로젝트 환경을 확인하는 `doctor`와 Claude Code용 워크플로 스킬
 
 ## 준비 사항
@@ -115,6 +116,7 @@ NewProject/
 ├── harness.json    # 추적 관계·검사 명령·AI 수정 범위
 ├── src/            # 미구현 API 뼈대
 ├── tests/          # 시나리오별 테스트
+├── .gitignore      # .harness·캐시 제외 (추적 입력 아님)
 └── .harness/       # 초안·실행 기록·AI 응답과 로그
 ```
 
@@ -268,7 +270,9 @@ CLI는 JSON 객체를 출력합니다. 검사 프로그램의 출력은 결과�
 │   ├── implement-1/
 │   └── review-1/                  # 검토 응답·changes.diff
 ├── incidents/                    # 증거 변경 감지 시 보존한 호출 자료
-└── integrity-violation.json       # 증거 변경 감지 시 생성되는 표시
+├── integrity-violation.json       # 증거 변경 감지 시 생성되는 표시
+├── lock                          # run·agent·init의 운영체제 잠금 파일
+└── lock-owner.json               # 잠금 보유 명령·PID·시작 시각
 ```
 
 AI 호출 자료에는 프롬프트, 응답 스키마, 응답 JSON, 표준 출력·오류 로그가 포함됩니다. 응답 형식을 보정했다면 단계 폴더의 `repair/`에 보정 자료도 저장합니다.
@@ -276,11 +280,13 @@ AI 호출 자료에는 프롬프트, 응답 스키마, 응답 JSON, 표준 출�
 두 종류의 변경 확인을 구분합니다.
 
 - **검증 결과의 유효성:** 계약과 `inputs`의 경로·내용을 해시합니다. 입력이 바뀌면 기존 결과 전체를 보수적으로 `stale`로 처리합니다. 입력에는 테스트 설정·의존성 잠금 파일 등 결과에 영향을 주는 파일도 포함해야 합니다.
-- **AI 수정 범위:** 호출 전후에 추적 입력 밖의 파일도 비교합니다. 증거 폴더는 별도로 검사하며, 기존 증거 변경이 감지되면 이력을 신뢰하지 않도록 표시하고 중단합니다.
+- **AI 수정 범위:** 호출 전후에 추적 입력 밖의 파일도 비교합니다. 허용 경로 안이라도 `__pycache__`, `.venv` 같은 캐시·환경 폴더의 변경은 거부합니다. Python은 `-B`에서도 캐시된 bytecode를 읽기 때문입니다. 증거 폴더는 별도로 검사하며, 기존 증거 변경이 감지되면 이력을 신뢰하지 않도록 표시하고 중단합니다.
 
 검증 입력을 순회할 때는 `.git`, `.harness`, `.venv`, `__pycache__`, `.pytest_cache`를 제외합니다. AI 수정 범위를 검사하는 전체 프로젝트 비교는 이 검증 입력 해시와 별개입니다.
 
 변경 감지는 호출 전후 비교이며 OS 보안 격리나 암호학적 증거 인증을 제공하지 않습니다. 실행 도중 변경 후 복원된 내용을 모두 탐지하지는 못합니다. 검사 명령은 프로젝트 코드를 실행하므로 신뢰할 수 있는 프로젝트에서 사용합니다.
+
+`run`, `agent`, `init`은 증거를 쓰기 전에 `.harness/lock`을 잠급니다. 같은 프로젝트에서 두 번째 명령은 기다리지 않고 아무것도 쓰지 않은 채 `project_locked`로 끝나므로, 동시 실행이 서로의 기록을 증거 변경으로 오인하지 않습니다. 잠금은 보유 프로세스가 끝나면(강제 종료 포함) 운영체제가 해제하므로 잠금 파일을 지울 필요가 없습니다. `check`, `status`, `doctor`는 잠그지 않습니다.
 
 ## 중단 원인과 대응
 
@@ -289,18 +295,26 @@ AI 호출 자료에는 프롬프트, 응답 스키마, 응답 JSON, 표준 출�
 | `reason` | 확인할 내용 |
 | --- | --- |
 | `agent_question` | 질문에 답하고 명세의 모호한 부분 정리 |
-| `red_not_observed`, `scaffold_not_red` | 기대·관측 Red ID, `check_diagnostics`, `verification_record` 확인 |
+| `red_not_observed`, `scaffold_not_red` | 기대·관측 Red ID, 검사별 `stub_red_problems`, `check_diagnostics`, `verification_record` 확인 |
 | `scope_changed`, `contract_changed` | `changed_files`와 실제 diff 검토 |
+| `review_scope` | 검토가 요구한 명세·테스트·보호 파일 변경을 사람이 결정 |
+| `inputs_changed`, `brief_changed`, `project_changed` | 실행 중 다른 편집이 있었는지 확인한 뒤 다시 실행 |
 | `evidence_changed` | 무결성 표시·변경된 증거·incident 로그 확인 및 손상 기록 복구·격리 |
 | `verification_setup` | 검사 도구·의존성·실행 오류·시간 초과 해결 |
 | `invalid_response` | 원본 응답과 `repair/` 확인 |
+| `agent_missing`, `agent_launch` | CLI 설치·실행 권한·로그인 확인(`agent_missing`은 `missing`에 목록이 있음). `doctor`로 다시 점검 |
 | `agent_exit`, `agent_timeout`, `verification_error` | 호출 로그·검증 기록과 필요 시 `doctor` 확인 |
+| `project_locked` | `lock_owner`의 명령이 끝날 때까지 기다림. 잠금 파일은 지우지 않음 |
+| `requirement_required` | 검토할 요구사항을 `--requirement`로 지정 |
+| `input_error` | `message`의 경로·형식·권한 문제 해결 |
 | `interrupted` | 저장된 단계와 현재 변경을 검토한 뒤 새 실행 시작 |
 | `no_progress`, `attempt_limit`, `review_rejected` | 남은 실패 검사 또는 검토 지적 해결 |
 
 잘못된 구조화 응답은 원래 작업을 반복하지 않는 읽기 전용 형식 보정을 한 번 시도합니다. 인증 오류·실행 실패·시간 초과는 같은 방식으로 자동 재호출하지 않습니다.
 
-SIGINT·처리 가능한 SIGTERM 또는 시간 초과 시 자식 프로세스 트리 정리를 시도합니다. `agent`, `init`, 검사 실행은 처리 가능한 중단을 기록합니다. SIGKILL이나 Windows의 강제 프로세스 종료처럼 처리할 수 없는 종료에서는 기록을 보장할 수 없습니다.
+SIGINT·처리 가능한 SIGTERM 또는 시간 초과 시 자식 프로세스 트리 정리를 시도합니다. POSIX는 SIGTERM을 보내고 3초 뒤 SIGKILL을 보내며, Windows는 `taskkill /T /F`로 바로 종료합니다. `agent`, `init`, 검사 실행은 처리 가능한 중단을 기록합니다. SIGKILL이나 Windows의 강제 프로세스 종료처럼 처리할 수 없는 종료에서는 기록을 보장할 수 없고, SIGHUP은 처리하지 않습니다.
+
+`agent`와 `init`은 시작할 때 workflow에 필요한 CLI가 PATH에 있는지 먼저 확인합니다. 없으면 기준 검사나 모델 호출 전에 `agent_missing`으로 끝납니다.
 
 중단 시 소스를 자동으로 되돌리지 않습니다. 세션 재개 기능은 없으며 다시 실행하면 현재 파일을 새로 검증합니다. 증거 변경이 감지됐다면 영향받은 기록을 검토·복구 또는 격리한 뒤 무결성 표시를 제거하고 재검증해야 합니다.
 
@@ -337,13 +351,13 @@ python -B -m harness run
 python -B -m harness status
 ```
 
-테스트 모음은 CLI, AI 실행기, 역할 분리, 초기화, 변경 감지·증거 보호를 다룹니다. 하네스 자체의 요구사항과 검사 연결은 [harness.json](harness.json), 상세 설계는 [SPEC.md](SPEC.md)를 참고하세요.
+테스트 모음은 CLI, AI 실행기, 역할 분리, 초기화, 변경 감지·증거 보호, 잠금을 다룹니다. 모든 테스트가 `harness.json`의 검사에 연결되어 있는지도 테스트로 확인합니다. 하네스 자체의 요구사항과 검사 연결은 [harness.json](harness.json), 상세 설계는 [SPEC.md](SPEC.md)를 참고하세요.
 
 ## 현재 범위
 
 자연어 초기화는 Python 3.11 이상·표준 라이브러리·unittest 프로젝트를 대상으로 합니다. 기존 프로젝트의 검증은 등록된 명령을 실행하며 필요한 도구와 의존성은 사용자가 준비합니다.
 
-한 번의 AI 개발 실행은 요구사항 하나를 처리합니다. 같은 프로젝트의 동시 실행 조율·병렬 개발·세션 재개는 지원하지 않습니다. 명세 근거의 구조화된 표시와 별도 독립 QA 단계도 향후 검토 대상입니다.
+한 번의 AI 개발 실행은 요구사항 하나를 처리합니다. 같은 프로젝트에서는 잠금으로 `run`·`agent`·`init`을 한 번에 하나만 실행하며, 대기열·병렬 개발·세션 재개는 지원하지 않습니다. 명세 근거의 구조화된 표시와 별도 독립 QA 단계도 향후 검토 대상입니다.
 
 테스트 통과와 Claude 승인은 검증 근거입니다. 생성된 명세의 업무적 가정과 테스트가 실제 사용자 의도를 충분히 반영하는지는 사람이 함께 확인해야 합니다.
 

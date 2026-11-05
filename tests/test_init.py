@@ -47,7 +47,8 @@ class InitTests(unittest.TestCase):
 
     def run_with(self, claude=None, codex=None):
         with patch("harness.spec.invoke_claude", side_effect=claude or (lambda *args: specification())) as designer, \
-                patch("harness.spec.invoke_codex", side_effect=codex or scaffold) as builder:
+                patch("harness.spec.invoke_codex", side_effect=codex or scaffold) as builder, \
+                patch("harness.spec.require_providers"):
             result = run_init(self.root, self.brief)
         self.assertEqual(json.loads((self.root / result["record"]).read_text(encoding="utf-8")), result)
         return result, designer, builder
@@ -68,6 +69,10 @@ class InitTests(unittest.TestCase):
         self.assertEqual((self.root / "BRIEF.md").read_text(encoding="utf-8"), self.brief.read_text(encoding="utf-8"))
         self.assertEqual(project_status(self.root, manifest, fingerprint(self.root, manifest))["status"], "failed")
         self.assertEqual(result["next_command"][-2:], ["--requirement", "REQ-VALUE"])
+        ignored = (self.root / ".gitignore").read_text(encoding="utf-8").splitlines()
+        self.assertIn(".harness/", ignored)
+        self.assertIn(".gitignore", result["artifacts"])
+        self.assertNotIn(".gitignore", manifest["inputs"])
 
     def test_generated_project_enters_existing_agent_workflow(self):
         from harness.agent import run_agent
@@ -79,6 +84,7 @@ class InitTests(unittest.TestCase):
             return {"outcome": "continue", "summary": "Implement the value contract",
                     "question": "", "red_check_ids": ["CHK-001"]}
         with patch("harness.agent.invoke_codex", side_effect=implement), \
+                patch("harness.agent.require_providers"), \
                 patch("harness.claude.invoke_claude", side_effect=lambda root, context, *args:
                       design() if context["phase"] == "design" else review()):
             result = run_agent(self.root, load_manifest(self.root))
@@ -120,7 +126,9 @@ class InitTests(unittest.TestCase):
         self.assertFalse((self.root / "src").exists())
 
     def test_missing_tests_and_already_implemented_scaffolds_are_rejected(self):
-        for kind in ("no_tests", "implemented", "import_error", "fake_failure", "test_only_error"):
+        problems = {"no_tests": "no_tests", "implemented": "not_failing", "import_error": "import_error",
+                    "fake_failure": "assertion_failures", "test_only_error": "not_source_stub"}
+        for kind in problems:
             with self.subTest(kind=kind):
                 def broken(root, context, directory, timeout):
                     response = scaffold(root, context, directory, timeout)
@@ -142,6 +150,7 @@ class InitTests(unittest.TestCase):
                 result, _, _ = self.run_with(codex=broken)
                 self.assertEqual(result["status"], "needs_input")
                 self.assertEqual(result["reason"], "scaffold_not_red")
+                self.assertEqual(result["stub_red_problems"], {"CHK-001": problems[kind]})
                 self.assertFalse((self.root / "harness.json").exists())
 
     def test_wrong_red_ids_cannot_complete_initialization(self):
@@ -226,15 +235,31 @@ class InitTests(unittest.TestCase):
         result, _, _ = self.run_with(codex=broken)
         self.assertEqual(result["status"], "needs_input")
         self.assertEqual(result["reason"], "scaffold_not_red")
+        self.assertEqual(result["stub_red_problems"], {"CHK-001": "import_error"})
         self.assertFalse((self.root / "harness.json").exists())
 
+    def test_partial_or_mixed_unittest_outcomes_are_explained(self):
+        from harness.spec import stub_red_problem
+        def result(stderr, exit_code=1, reason="exit_code"):
+            return {"status": "failed" if exit_code else "passed", "reason": reason,
+                    "exit_code": exit_code, "stderr": stderr}
+        for value, problem in [(result("", None, "timeout"), "timeout"),
+                               (result("Ran 2 tests in 0.1s\n\nFAILED (errors=1)\n"), "partial_errors"),
+                               (result("Ran 2 tests in 0.1s\n\nFAILED (errors=1, skipped=1)\n"), "unexpected_outcomes"),
+                               (result("Ran 1 test in 0.1s\nSegmentation fault\n"), "unrecognized_output")]:
+            with self.subTest(problem=problem):
+                self.assertEqual(stub_red_problem(self.root, value), problem)
+
     def test_reserved_brief_name_is_rejected_before_generation(self):
-        self.brief = self.root / "SPEC.md"
-        self.brief.write_text("Return 2", encoding="utf-8")
-        with patch("harness.spec.invoke_claude") as claude, self.assertRaisesRegex(ValueError, "reserved"):
-            run_init(self.root, self.brief)
-        claude.assert_not_called()
-        self.assertEqual(list(self.root.iterdir()), [self.brief])
+        for name in ("SPEC.md", ".gitignore"):
+            with self.subTest(name=name):
+                self.brief = self.root / name
+                self.brief.write_text("Return 2", encoding="utf-8")
+                with patch("harness.spec.invoke_claude") as claude, self.assertRaisesRegex(ValueError, "reserved"):
+                    run_init(self.root, self.brief)
+                claude.assert_not_called()
+                self.assertEqual(list(self.root.iterdir()), [self.brief])
+                self.brief.unlink()
 
     def test_claude_spec_uses_spec_schema_and_instructions(self):
         from harness.claude import invoke_claude

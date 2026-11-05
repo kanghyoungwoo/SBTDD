@@ -1,4 +1,4 @@
-# SDD · BDD · TDD Harness 명세 v0.4
+# SDD · BDD · TDD Harness 명세 v0.5
 
 ## 목적과 범위
 
@@ -36,6 +36,10 @@ Given/When/Then의 원본은 JSON이다. 별도 Gherkin 사본이나 파서를 �
 | REQ-AGENT | 요구사항 하나를 선택해 테스트·구현·회귀 검증을 수행하고, 제한된 재시도와 중단 이유를 기록한다. |
 | REQ-ROLES | Claude 설계 → Codex 구현 → CLI 검증 → Claude 검토를 연결하고, 검사와 검토가 모두 통과해야 완료한다. |
 | REQ-INIT | 빈 프로젝트의 자연어 요구를 명세·BDD·미구현 API·실패 테스트로 변환하고 기존 개발 루프에 연결한다. |
+| REQ-GUARD | AI 호출과 검사 실행 전후로 프로젝트와 증거 폴더를 비교해 허용 범위 밖 변경을 거부하고, 증거가 바뀌면 이력을 신뢰하지 않도록 표시한다. |
+| REQ-RECOVERY | 잘못된 AI 응답은 읽기 전용 형식 보정을 한 번만 시도하고, 중단 신호와 시간 초과에서는 자식 프로세스를 정리하고 중단을 기록한다. |
+| REQ-PREFLIGHT | 모델을 호출하지 않고 로컬 CLI·로그인·프로젝트를 점검하며, 필요한 AI CLI가 없으면 검사와 모델 호출 전에 중단한다. |
+| REQ-LOCK | 실행 기록을 쓰는 명령은 프로젝트마다 한 번에 하나만 실행하고, 기다리지 않고 거절된 명령은 증거를 바꾸지 않는다. |
 
 ## CLI 계약
 
@@ -43,6 +47,7 @@ Given/When/Then의 원본은 JSON이다. 별도 Gherkin 사본이나 파서를 �
 python -m harness [--root PROJECT] check
 python -m harness [--root PROJECT] run [--requirement ID]
 python -m harness [--root PROJECT] status
+python -m harness [--root PROJECT] doctor [--provider all|codex|claude]
 ```
 
 각 명령은 표준 출력으로 JSON 객체 하나를 출력한다. 스키마 버전은 1이다.
@@ -52,8 +57,9 @@ python -m harness [--root PROJECT] status
   앞선 검사 실패 후에도 나머지 선택 검사를 실행한다. 결과는
   `.harness/runs/<run-id>.json`에 실행별로 보존한다.
 - `status`: 테스트를 실행하지 않고 각 검사의 가장 최근 실행을 현재 입력과 비교한다.
-- 종료 코드: 0 = 구조 검사 성공 또는 대상 검사 전체 통과,
-  1 = 실패·미검증·오래된 결과 존재, 2 = 계약·기록·입출력 오류.
+- `doctor`: 모델을 호출하지 않는 사전 점검이다. 계약이 없어도 실행한다.
+- 종료 코드: 0 = 구조 검사 성공, 대상 검사 전체 통과 또는 ready,
+  1 = 실패·미검증·오래된 결과·확인 필요, 2 = 계약·기록·입출력·잠금 오류.
 
 명령은 문자열 배열이며 셸 문법을 해석하지 않는다. `{python}` 토큰은 현재
 Python 실행 파일로 치환한다. 검사별 `timeout_seconds`는 양의 정수이고 기본 30초다.
@@ -86,6 +92,55 @@ stale로 취급한다. `inputs` 밖의 파일, OS·환경변수·외부 서비�
 집계 우선순위는 failed → stale → unverified → passed이며 상세 결과도 함께 제공한다.
 선택 실행은 선택하지 않은 검사의 기존 결과를 덮어쓰지 않는다.
 
+## 변경 감지와 증거 보호
+
+fingerprint의 inputs 추적과 별도로, 실행기는 AI 호출마다 호출 전후의 프로젝트 전체를 비교한다.
+비교 대상은 `.harness`를 제외한 모든 파일·디렉터리·링크이며 `.git`, `.venv`, 캐시 폴더도 포함한다.
+다음 변경은 scope_changed(needs_input)로 중단한다.
+
+- 현재 단계의 허용 경로 밖 변경. 설계·검토·응답 보정에는 허용 경로가 없다.
+- 테스트 단계의 기존 파일 수정·삭제와 심볼릭 링크 생성.
+- 허용 경로 안이라도 `.git`, `.harness`, `.venv`, `__pycache__`, `.pytest_cache` 아래의 변경.
+  이 폴더들은 fingerprint와 검토 diff에 들어가지 않지만, Python은 `-B`에서도 캐시된
+  bytecode를 읽으므로 실제로 실행되는 코드를 바꿀 수 있다.
+
+허용 경로 밖의 변경은 이 검사가 막으므로 Claude 검토 diff는 추적 입력만 포함한다.
+
+`.harness` 증거 폴더는 AI 호출과 검사 실행 전후에 따로 비교한다. 기존 기록의 추가·수정·삭제가
+감지되면 `.harness/integrity-violation.json`을 남기고 evidence_changed로 중단하며, 그 AI 호출의
+자료는 `.harness/incidents/`에 보존한다. 이 표시가 있는 동안 run, status, agent, init은 이력을
+사용하지 않고 오류로 끝난다. 사람이 영향받은 기록을 검토·복구 또는 격리한 뒤 표시를 지운다.
+AI 호출의 프롬프트·스키마·로그·응답은 프로젝트 밖 임시 폴더에서 받아 Harness가 증거 폴더로 복사한다.
+
+실행기가 호출하는 검증 CLI는 Harness 설치 위치에서 Python `-I` 격리 모드로 실행한다. 따라서
+프로젝트의 `harness.py`, `sitecustomize.py`, PYTHONPATH가 검증기를 대체하지 못한다.
+이 감지는 호출 전후 비교이며 OS 보안 격리나 암호학적 증거 인증이 아니다. 호출 중 변경 후
+복원된 내용과, 호출이 끝난 뒤에도 남은 프로세스가 쓰는 내용은 보장하지 않는다.
+
+## 동시 실행 잠금
+
+run, agent, init은 증거를 쓰기 전에 `.harness/lock`에 운영체제 파일 잠금(POSIX `flock`,
+Windows `msvcrt.locking`)을 건다. 잠금을 얻지 못한 명령은 기다리지 않고, 파일을 하나도 쓰지 않은 채
+`reason: project_locked`와 `lock_owner`(명령·PID·시작 시각)를 포함한 error(종료 코드 2)로 끝난다.
+잠금은 보유 프로세스가 강제 종료를 포함해 어떤 이유로든 끝나면 운영체제가 해제하므로 잠금 파일을
+지울 필요가 없다. check, status, doctor는 증거를 쓰지 않으므로 잠그지 않는다.
+
+agent와 init이 호출하는 검증 CLI는 보유자가 넘긴 일회용 토큰으로 같은 잠금 아래에서 실행된다.
+`.harness/lock-owner.json`에는 토큰의 SHA-256만 기록한다. AI CLI와 검사 명령의 환경에서는 토큰을
+제거하므로, 이들이 실행한 Harness 명령은 잠금을 빌리지 못하고 거절된다. 잠금은 정직한 프로세스
+사이의 조율 수단이며 보안 경계가 아니다.
+
+## 사전 점검
+
+`doctor`는 Python 버전, 프로젝트 접근, 증거 무결성 표시, 존재하는 계약, Codex·Claude CLI의
+경로·버전·로그인 상태를 확인한다. `--provider`로 한 CLI만 확인할 수 있다. 모델 호출, 로그인,
+사용량 확인은 하지 않으며 인증 명령의 출력 원문을 결과에 넣지 않는다. 모든 항목이 통과하면 ready,
+아니면 항목별 reason과 action을 포함한 needs_input이다.
+
+agent와 init은 시작할 때 workflow에 필요한 CLI가 PATH에 있는지 먼저 확인한다. codex 흐름은 Codex,
+claude-codex 흐름과 init은 Claude와 Codex가 필요하다. 하나라도 없으면 기준 검사와 모델 호출 전에
+`agent_missing`과 `missing` 목록으로 끝난다.
+
 ## 신규 프로젝트 초기화 계약
 
 ```text
@@ -94,12 +149,14 @@ python -m harness --root PROJECT init --brief FILE [--timeout-seconds 300]
 
 FILE은 현재 작업 디렉터리 기준 UTF-8 자연어 요구 파일이다. PROJECT는 아직 없거나
 원본 요구 파일과 `.harness` 이력을 제외하고 비어 있어야 한다. 기존 프로젝트의 계약을
-덮어쓰거나 마이그레이션하지 않는다. 대상 폴더 안의 요구 파일은 생성물의 예약 이름과
-충돌할 수 없다. Python >=3.11, 표준 라이브러리, unittest를 사용한다.
+덮어쓰거나 마이그레이션하지 않는다. 대상 폴더 안의 요구 파일은 생성물의 예약 이름
+(SPEC.md, harness.json, src, tests, .harness, .gitignore)과 충돌할 수 없다.
+Python >=3.11, 표준 라이브러리, unittest를 사용한다.
 
 Claude의 spec 단계는 outcome/summary/question/title/design/requirements/scenarios를
 반환한다. 명세·설계의 이름과 API 구조는 제안할 수 있지만 업무 규칙이 빠져 있으면
-needs_input이다. 소스 코드는 생성하지 않는다. 요구사항·시나리오 연결은 기존 CLI의
+needs_input이다. 브리프가 정하지 않은 내용은 질문하거나, 사용자가 검토할 수 있도록 설계에
+가정으로 명시한다. 소스 코드는 생성하지 않는다. 요구사항·시나리오 연결은 기존 CLI의
 계약 검증을 재사용한다. 시나리오마다 CHK-NNN과 tests/test_scenario_NNN.py를 대응시키고
 고정된 unittest discover 명령을 하네스가 생성한다. 모델이 검사 명령을 지정하지 않는다.
 
@@ -117,10 +174,15 @@ Codex scaffold 단계는 src/와 tests/에 새 파일만 추가한다. 공개 AP
 unittest의 결과와 traceback에서 이를 확인한다. 선언된 red_check_ids도 전체 검사와
 일치해야 한다. 빈 테스트, 이미 통과한 구현, import·문법 오류, 테스트 본문에서 직접
 발생시킨 NotImplementedError는 준비 완료가 아니다. 업무 의미의 충족까지 자동 인증하지 않는다.
+scaffold_not_red는 조건을 충족하지 못한 검사마다 `stub_red_problems`에 사유를 남긴다.
+사유는 no_tests, not_failing, import_error, assertion_failures, partial_errors,
+unexpected_outcomes, not_source_stub, unrecognized_output 또는 timeout 같은 실행 사유다.
 
 검사 중 입력이 바뀌거나 보호 파일이 바뀌면 중단한다. 원본 요구와 대상 폴더도 배치 직전에
 다시 확인한다. 검증된 추적 파일만 기존 파일을 덮어쓰지 않고 복사하고, 입력 fingerprint가
-동일한 Red 기록을 보존한다. 이후 agent가 실제 프로젝트 위치에서 기준 검사를 다시 실행한다.
+동일한 Red 기록을 보존한다. `.harness/`, `__pycache__/`, `.venv/`를 제외하는 `.gitignore`도
+만든다. `.gitignore`는 추적 입력이 아니므로 fingerprint를 바꾸지 않는다.
+이후 agent가 실제 프로젝트 위치에서 기준 검사를 다시 실행한다.
 
 ready(종료 코드 0)는 구현 준비 완료이며 테스트 상태는 failed다. needs_input은 1,
 error는 2다. ready 응답에 생성 파일, 요구사항 ID, fingerprint, red_check_ids와 첫 대상의
@@ -147,7 +209,7 @@ python -m harness [--root PROJECT] agent [--requirement ID]
 
 실행 순서는 다음과 같다.
 
-1. 공통 CLI의 check, run, status를 호출해 전체 기준 결과를 새로 만든다.
+1. 필요한 AI CLI를 확인한 뒤, 공통 CLI의 check, run, status를 호출해 전체 기준 결과를 새로 만든다.
 2. 요구사항을 지정하지 않으면 명세 순서대로 첫 실패 요구사항을 선택한다.
    codex 흐름은 이미 통과한 대상을 AI 없이 종료한다. claude-codex 흐름에서 모두
    통과했으면 requirement_required로 대상 선택을 요청한다. 명시적으로 선택한 대상은
@@ -173,6 +235,12 @@ python -m harness [--root PROJECT] agent [--requirement ID]
 findings(path/issue/change)를 반환한다. 승인은 빈 findings, 수정 요청은 하나 이상의
 구체적 finding이 필수다. 명세·테스트·허용 코드 경로 밖의 변경 요청은 needs_input이다.
 
+검토자는 이번 라운드에서 발견한 막는 문제를 모두 나열한다. 선택한 요구사항의 시나리오가
+실행하는 동작에 남은 스텁·플레이스홀더·TODO·NotImplementedError는 구현으로 인정하지 않는다.
+다른 요구사항을 위한 스텁은 요구사항을 하나씩 개발하는 과정에서 정상이므로 지적하지 않는다.
+모든 AI 역할은 확인하지 않은 내용을 결과로 주장하지 않는다. 이 규칙은 지시문으로 전달되며
+모델의 준수 여부는 검사 결과와 사람의 확인으로 판단한다.
+
 자동 실행 한 번은 요구사항 하나만 처리한다. 기존에 실패한 다른 요구사항이 남아 있어도
 선택한 요구사항은 완료할 수 있으며, 응답의 `project_status`로 전체 상태를 구분한다.
 실행기에 재시작 시 세션을 이어가는 기능은 없다. 다시 실행하면 현재 파일에서 재검증한다.
@@ -182,14 +250,14 @@ findings(path/issue/change)를 반환한다. 승인은 빈 findings, 수정 요�
 | 결과 | 원인 |
 | --- | --- |
 | passed | 대상 요구사항 통과, 기존 통과 검사에 회귀 없음, Claude 흐름이면 검토 승인 |
-| needs_input | 질문, 명세·허용 범위 위반, Red 부재, 실행 중 입력 변경, 검사 실행 환경 문제 |
+| needs_input | 질문, 명세·허용 범위 위반, 증거 변경, Red 부재, 실행 중 입력 변경, 검사 실행 환경 문제, 중단 신호 |
 | failed | 시도 한도 도달, 검토 수정 요청 미해결, 코드 변경 없는 반복 |
-| error | AI 실행 실패·시간 초과·잘못된 응답, 검증 CLI 오류 |
+| error | 필요한 AI CLI 없음, AI 실행 실패·시간 초과·잘못된 응답, 검증 CLI 오류, 다른 명령의 잠금 |
 
 종료 코드는 passed=0, needs_input/failed=1, error=2다.
 중단 시 수정 내용을 자동으로 되돌리지 않고 이유와 변경 파일 목록을 기록한다.
-허용 경로 검사는 inputs에 등록된 파일의 전후 비교다. 실행 중 변경 후 복원이나
-inputs 밖의 파일까지 보장하는 보안 격리 수단이 아니며 Codex의 sandbox와 별개다.
+수정 범위와 증거의 변경 감지는 변경 감지와 증거 보호 절을 따른다. 이 감지는 Codex의 sandbox와
+별개이며 그것을 대체하지 않는다.
 
 `.harness/agent-runs/<session-id>/run.json`에 단계, 검증 실행 ID, 시도 횟수,
 선택 요구사항, 전체 프로젝트 상태와 중단 이유를 저장한다. AI 호출마다 prompt,
@@ -204,7 +272,15 @@ agent 실행의 run.json과 연결된 파일 상태에만 유효하며 변조 �
 Codex 호출은 저장된 로그인과 모델 설정을 사용한다. workspace-write sandbox와
 approval=never로 실행하므로 추가 권한이 필요한 작업은 실행기가 임의로 허용하지 않는다.
 프로젝트가 Git 저장소가 아닌 예제도 지원하며, CLI가 요구하는 저장소 확인은 명시적으로
-생략한다. AI 프로세스의 시간 초과 시 프로세스 트리 종료를 시도하고 자동 재시도하지 않는다.
+생략한다. AI 프로세스의 시간 초과나 중단 시 프로세스 트리를 정리한다. POSIX는 프로세스 그룹에
+SIGTERM을 보내고 3초 뒤 SIGKILL을 보내며, Windows는 `taskkill /T /F`로 바로 종료한다.
+SIGINT와 처리 가능한 SIGTERM은 run, agent, init에서 interrupted로 기록한다. SIGKILL처럼
+처리할 수 없는 종료는 기록을 보장하지 않으며 SIGHUP은 처리하지 않는다.
+
+인증 오류·실행 실패·시간 초과는 다시 호출하지 않는다. 구조화 응답이 스키마나 검증 규칙에 맞지
+않을 때만 원래 작업을 반복하지 않는 형식 보정을 한 번 호출한다. Codex 보정은 read-only sandbox,
+Claude 보정은 도구 없이 실행하고 보정 중 프로젝트 변경은 scope_changed다. 보정 자료는 단계 폴더의
+`repair/`에 저장하며, 보정 결과도 맞지 않으면 invalid_response로 끝난다.
 Claude는 저장된 로그인을 사용하며 --safe-mode, 읽기 도구 Read/Glob/Grep만 제공,
 dontAsk, --no-session-persistence로 호출한다. MCP 도구는 허용하지 않는다.
 관리 정책은 유지되며 이 도구 제한과 추적 파일 비교가 OS 보안 격리를 대체하지 않는다.
@@ -223,6 +299,10 @@ CLI를 외부 프로세스로 호출하는 인수 테스트로 정상·누락·�
 실행기 테스트는 AI 응답을 대체하면서 실제 공통 CLI를 호출해 상태 전이를 확인한다.
 Codex와 Claude 어댑터는 인자·표준 입력·구조화된 응답·오류 처리를 검증하고,
 역할별 실행 순서, 거절 후 재검증, 질문·보호 파일·입력 변경 중단을 검증한다.
+변경 감지·증거 보호, 형식 보정·중단, 사전 점검은 `tests/test_hardening.py`, 잠금은
+`tests/test_lock.py`가 검증한다. 저장소의 모든 테스트는 `harness.json`의 검사 하나 이상에
+연결되어야 하며, 연결되지 않은 테스트가 있으면 REQ-LINK 검사가 실패한다.
 별도 재고 예제에서 실제 Claude 설계·검토와 Codex 구현 연결을 확인한다. 외부 모델을 사용하는 검사는 기본 테스트 실행에 포함하지 않는다.
 
-기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.4 범위에 포함하지 않는다.
+기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.5 범위에 포함하지 않는다.
+SIGHUP 처리, Windows 프로세스의 단계적 종료, 잠금 대기, stat 기반의 빠른 변경 비교도 이번 범위가 아니다.

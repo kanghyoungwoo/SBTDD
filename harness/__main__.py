@@ -7,6 +7,7 @@ from .core import HarnessError, fingerprint, load_manifest, project_status, run_
 from .agent import run_agent
 from .spec import run_init
 from .doctor import run_doctor
+from .lock import ProjectLocked
 
 
 class Parser(argparse.ArgumentParser):
@@ -52,6 +53,11 @@ def main():
         elif args.command == "status":
             result = project_status(root, manifest, current)
         exit_code = 0 if result["status"] in ("valid", "passed", "ready") else 2 if result["status"] == "error" else 1
+    except ProjectLocked as error:
+        # Nothing was written: another harness process owns the evidence folder right now.
+        result = {"schema_version": 1, "command": args.command, "status": "error", "reason": "project_locked",
+                  "error": str(error), "lock_owner": error.owner}
+        exit_code = 2
     except (HarnessError, OSError) as error:
         result = {"schema_version": 1, "status": "error", "error": str(error)}
         exit_code = 2

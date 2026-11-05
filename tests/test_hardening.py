@@ -35,6 +35,25 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'scope_changed')
         self.assertIn('__pycache__/test_logic.pyc', result['changed_files'])
 
+    def test_bytecode_cache_inside_allowed_paths_is_rejected(self):
+        package = self.root / 'pkg'
+        package.mkdir()
+        (package / '__init__.py').write_text('', encoding='utf-8')
+        self.manifest['inputs'].append('pkg')
+        self.manifest['agent']['code_paths'].append('pkg')
+        self.save()
+        def change(root, context, *args):
+            if context['phase'] == 'implement':
+                (root / 'logic.py').write_text('VALUE = 2\n', encoding='utf-8')
+                cache = root / 'pkg' / '__pycache__'
+                cache.mkdir()
+                (cache / '__init__.cpython-313.pyc').write_bytes(b'forged bytecode')
+            return test_agent.response()
+        result, _ = self.run_with(change)
+        self.assertEqual(result['reason'], 'scope_changed')
+        self.assertIn('pkg/__pycache__/__init__.cpython-313.pyc', result['changed_files'])
+        self.assertNotIn('logic.py', result['changed_files'])
+
     def test_untracked_existing_file_deletion_is_rejected_even_on_provider_error(self):
         keep = self.root / 'keep.txt'
         keep.write_text('user content', encoding='utf-8')
@@ -277,6 +296,36 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(result['status'], 'needs_input')
         self.assertEqual({item['reason'] for item in result['checks'] if item['status'] != 'passed'},
                          {'timeout', 'not_authenticated'})
+
+
+class ProviderPreflightTests(unittest.TestCase):
+    setUp = test_agent.AgentTests.setUp
+    save = test_cli.HarnessTests.save
+
+    def test_missing_provider_stops_before_verification_and_model_calls(self):
+        self.manifest['agent']['workflow'] = 'claude-codex'
+        self.save()
+        with patch('harness.agent.shutil.which', side_effect=lambda name: None if name == 'codex' else name), \
+                patch('harness.agent.verification_cli') as verifier, \
+                patch('harness.claude.invoke_claude') as claude:
+            result = run_agent(self.root, self.manifest)
+        self.assertEqual((result['status'], result['reason'], result['missing']), ('error', 'agent_missing', ['codex']))
+        self.assertIn('codex login', result['message'])
+        self.assertEqual(result['phases'], [])
+        verifier.assert_not_called()
+        claude.assert_not_called()
+
+    def test_init_checks_both_providers_before_paying_for_a_spec(self):
+        from harness.spec import run_init
+        project = self.root / 'new'
+        brief = self.root / 'brief.txt'
+        brief.write_text('Return 2', encoding='utf-8')
+        with patch('harness.agent.shutil.which', return_value=None), \
+                patch('harness.spec.invoke_claude') as claude:
+            result = run_init(project, brief)
+        self.assertEqual((result['reason'], result['missing']), ('agent_missing', ['claude', 'codex']))
+        claude.assert_not_called()
+        self.assertEqual([p.name for p in (project / result['draft']).iterdir()], ['BRIEF.md'])
 
 
 class ExecutionBoundaryTests(unittest.TestCase):

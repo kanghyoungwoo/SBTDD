@@ -9,11 +9,16 @@
     {"id": "REQ-EVIDENCE", "description": "실행 이력을 보존하며 부분 실행과 실행 중 변경을 처리한다."},
     {"id": "REQ-AGENT", "description": "AI가 요구사항 하나를 테스트 단계와 구현 단계로 처리하고 검증 결과에 따라 완료하거나 중단한다."},
     {"id": "REQ-ROLES", "description": "기존 명세를 바탕으로 Claude가 설계하고 Codex가 구현하며 공통 CLI 검증과 Claude 검토를 모두 통과해야 완료한다."},
-    {"id": "REQ-INIT", "description": "빈 프로젝트에서 자연어 요구사항으로 명세·BDD와 테스트 뼈대를 만들고 미구현 API의 실패를 확인하여 기존 구현 흐름에 연결한다."}
+    {"id": "REQ-INIT", "description": "빈 프로젝트에서 자연어 요구사항으로 명세·BDD와 테스트 뼈대를 만들고 미구현 API의 실패를 확인하여 기존 구현 흐름에 연결한다."},
+    {"id": "REQ-GUARD", "description": "AI 호출과 검사 실행 전후로 프로젝트와 증거 폴더를 비교해 허용 범위 밖 변경을 거부하고, 증거가 바뀌면 이력을 신뢰하지 않도록 표시한다."},
+    {"id": "REQ-RECOVERY", "description": "잘못된 AI 응답은 읽기 전용 형식 보정을 한 번만 시도하고, 중단 신호와 시간 초과에서는 자식 프로세스를 정리하고 중단을 기록한다."},
+    {"id": "REQ-PREFLIGHT", "description": "모델을 호출하지 않고 로컬 CLI·로그인·프로젝트를 점검하며, 필요한 AI CLI가 없으면 검사와 모델 호출 전에 중단한다."},
+    {"id": "REQ-LOCK", "description": "실행 기록을 쓰는 명령은 프로젝트마다 한 번에 하나만 실행하고, 거절된 명령은 증거를 바꾸지 않는다."}
   ],
   "scenarios": [
     {"id": "SCN-VALID-TRACE", "requirement": "REQ-LINK", "given": "모든 요구사항이 시나리오와 acceptance 검사에 연결되어 있다", "when": "계약을 검사한다", "then": "연결 수와 valid 상태를 반환한다"},
     {"id": "SCN-INVALID-TRACE", "requirement": "REQ-LINK", "given": "참조가 누락되었거나 계약 형식이나 입력 경로가 잘못되었다", "when": "계약을 검사한다", "then": "원인을 포함한 오류와 종료 코드 2를 반환한다"},
+    {"id": "SCN-SELF-TRACE", "requirement": "REQ-LINK", "given": "Harness 저장소에 테스트가 추가되었다", "when": "자기 계약의 연결을 검사한다", "then": "모든 테스트가 하나 이상의 검사 명령에 포함되지 않으면 실패한다"},
     {"id": "SCN-RUN-PASS", "requirement": "REQ-RUN", "given": "통과하는 테스트 명령이 등록되어 있다", "when": "검사를 실행한다", "then": "출력과 종료 코드를 저장하고 passed를 반환한다"},
     {"id": "SCN-RUN-FAIL", "requirement": "REQ-RUN", "given": "테스트 실패, 실행 오류 또는 시간 초과가 발생한다", "when": "검사를 실행한다", "then": "실패 원인을 기록하고 나머지 선택 검사도 실행한다"},
     {"id": "SCN-UNVERIFIED", "requirement": "REQ-STATE", "given": "검사를 실행한 기록이 없다", "when": "상태를 조회한다", "then": "파일을 생성하지 않고 unverified를 반환한다"},
@@ -28,21 +33,33 @@
     {"id": "SCN-AGENT-QUESTION", "requirement": "REQ-AGENT", "given": "요구사항이 모호하거나 실행 환경에 문제가 있다", "when": "AI 실행을 진행한다", "then": "질문이나 환경 문제를 기록하고 재시도하지 않는다"},
     {"id": "SCN-AGENT-REGRESSION", "requirement": "REQ-AGENT", "given": "수정으로 기존 통과 검사가 실패했다", "when": "전체 회귀 검증을 수행한다", "then": "회귀를 다음 시도에 전달하고 해결 전에는 완료하지 않는다"},
     {"id": "SCN-AGENT-PROTOCOL", "requirement": "REQ-AGENT", "given": "Codex가 잘못된 응답을 반환하거나 실행에 실패한다", "when": "호출 결과를 처리한다", "then": "오류를 기록하고 무한 반복하지 않는다"},
+    {"id": "SCN-AGENT-DIAGNOSTIC", "requirement": "REQ-AGENT", "given": "AI가 지목한 Red가 관측되지 않았다", "when": "중단 결과를 확인한다", "then": "기대·관측·누락 Red ID, 검사별 사유와 검증 기록 경로를 남긴다"},
     {"id": "SCN-ROLES-CYCLE", "requirement": "REQ-ROLES", "given": "기존 명세와 실패 검사가 있다", "when": "claude-codex 흐름을 실행한다", "then": "Claude 설계, Codex 테스트·구현, CLI 검증, Claude 검토를 순서대로 실행한다"},
     {"id": "SCN-ROLES-REVIEW", "requirement": "REQ-ROLES", "given": "검사는 통과했지만 Claude가 수정을 요청했다", "when": "시도 횟수가 남아 있다", "then": "검토 내용을 Codex에 전달하고 재검증·재검토하며 승인 전에는 완료하지 않는다"},
     {"id": "SCN-ROLES-EVIDENCE", "requirement": "REQ-ROLES", "given": "검토 전후로 추적 입력이 바뀌었다", "when": "Claude가 승인한다", "then": "승인을 완료 근거로 사용하지 않고 needs_input으로 중단한다"},
     {"id": "SCN-ROLES-BOUNDARY", "requirement": "REQ-ROLES", "given": "설계·검토에 질문이나 보호 파일 수정이 필요하다", "when": "Claude 응답을 처리한다", "then": "기존 명세를 바꾸지 않고 질문을 기록하며 실행을 중단한다"},
     {"id": "SCN-ROLES-GREEN", "requirement": "REQ-ROLES", "given": "명시적으로 선택한 요구사항의 검사가 이미 통과한다", "when": "claude-codex 흐름을 실행한다", "then": "Claude 설계·검토를 수행하고 승인 없이 완료하지 않는다"},
-    {"id": "SCN-ROLES-PROTOCOL", "requirement": "REQ-ROLES", "given": "Claude가 잘못된 응답을 반환하거나 실행에 실패한다", "when": "읽기 전용 호출 결과를 처리한다", "then": "원인과 로그를 기록하고 자동 재시도하지 않는다"},
-    {"id": "SCN-INIT-GENERATE", "requirement": "REQ-INIT", "given": "빈 프로젝트와 자연어 요구사항 파일이 있다", "when": "init을 실행한다", "then": "Claude 명세·BDD와 Codex API 뼈대·테스트를 만들고 일반 검증 CLI에 연결한다"},
-    {"id": "SCN-INIT-RED", "requirement": "REQ-INIT", "given": "시나리오별 테스트와 소스 뼈대가 생성됐다", "when": "준비 상태를 검사한다", "then": "모든 시나리오가 src의 NotImplementedError로 실패해야 ready이며 빈 테스트·설정 오류·인위적 실패는 거부한다"},
+    {"id": "SCN-ROLES-PROTOCOL", "requirement": "REQ-ROLES", "given": "Claude가 잘못된 응답을 반환하거나 실행에 실패한다", "when": "읽기 전용 호출 결과를 처리한다", "then": "원인과 로그를 기록하고 형식 보정 한 번 외에는 다시 호출하지 않는다"},
+    {"id": "SCN-ROLES-RULES", "requirement": "REQ-ROLES", "given": "AI 역할에 지시문을 전달한다", "when": "Claude 검토나 Codex 작업을 요청한다", "then": "막는 문제를 한 라운드에 모두 나열하고 선택한 요구사항의 스텁을 구현으로 인정하지 않으며 확인하지 않은 결과를 주장하지 말라고 요구한다"},
+    {"id": "SCN-INIT-GENERATE", "requirement": "REQ-INIT", "given": "빈 프로젝트와 자연어 요구사항 파일이 있다", "when": "init을 실행한다", "then": "Claude 명세·BDD와 Codex API 뼈대·테스트를 만들고 일반 검증 CLI에 연결하며 .harness를 제외하는 .gitignore를 만든다"},
+    {"id": "SCN-INIT-RED", "requirement": "REQ-INIT", "given": "시나리오별 테스트와 소스 뼈대가 생성됐다", "when": "준비 상태를 검사한다", "then": "모든 시나리오가 src의 NotImplementedError로 실패해야 ready이며 빈 테스트·설정 오류·인위적 실패는 검사별 사유와 함께 거부한다"},
     {"id": "SCN-INIT-PRESERVE", "requirement": "REQ-INIT", "given": "대상에 기존 파일이 있거나 생성 중 파일·요구사항이 바뀌었다", "when": "초기화를 진행한다", "then": "기존 파일을 덮어쓰지 않고 중단한다"},
     {"id": "SCN-INIT-QUESTION", "requirement": "REQ-INIT", "given": "명세가 모호하거나 AI 호출·응답에 문제가 있다", "when": "생성을 진행한다", "then": "질문이나 오류와 초안을 보존하고 프로젝트 파일을 배치하지 않는다"},
-    {"id": "SCN-INIT-HANDOFF", "requirement": "REQ-INIT", "given": "ready인 신규 프로젝트가 있다", "when": "agent를 실행한다", "then": "기존 Claude 설계·Codex 구현·CLI 검증·Claude 검토 흐름으로 완료한다"}
+    {"id": "SCN-INIT-HANDOFF", "requirement": "REQ-INIT", "given": "ready인 신규 프로젝트가 있다", "when": "agent를 실행한다", "then": "기존 Claude 설계·Codex 구현·CLI 검증·Claude 검토 흐름으로 완료한다"},
+    {"id": "SCN-GUARD-SCOPE", "requirement": "REQ-GUARD", "given": "AI가 추적 입력 밖의 파일을 바꾸거나 허용 경로 안의 캐시·환경 폴더에 파일을 쓴다", "when": "호출 결과를 확인한다", "then": "변경 파일을 기록하고 검증·검토 전에 needs_input으로 중단한다"},
+    {"id": "SCN-GUARD-EVIDENCE", "requirement": "REQ-GUARD", "given": "AI 호출이나 검사 명령이 실행 기록을 추가·수정·삭제한다", "when": "호출이나 검사가 끝난다", "then": "무결성 표시를 남기고 이후 이력을 통과 근거로 사용하지 않는다"},
+    {"id": "SCN-GUARD-VERIFIER", "requirement": "REQ-GUARD", "given": "프로젝트에 harness.py나 sitecustomize.py가 있다", "when": "실행기가 검증 CLI를 호출한다", "then": "프로젝트 코드가 아닌 Harness 검증기가 실행된다"},
+    {"id": "SCN-RECOVERY-REPAIR", "requirement": "REQ-RECOVERY", "given": "AI가 스키마에 맞지 않는 응답을 반환한다", "when": "응답을 처리한다", "then": "도구와 쓰기 없이 형식 보정을 한 번만 시도하고 다시 맞지 않으면 invalid_response로 끝낸다"},
+    {"id": "SCN-RECOVERY-SIGNAL", "requirement": "REQ-RECOVERY", "given": "실행 중 SIGINT·SIGTERM이나 시간 초과가 발생한다", "when": "Harness가 중단을 처리한다", "then": "자식 프로세스 트리를 정리하고 interrupted 상태와 기록을 남긴다"},
+    {"id": "SCN-DOCTOR", "requirement": "REQ-PREFLIGHT", "given": "CLI 설치·로그인 상태가 다양하다", "when": "doctor를 실행한다", "then": "모델을 호출하거나 계정 정보를 노출하지 않고 항목별 원인과 조치를 반환한다"},
+    {"id": "SCN-PREFLIGHT-MISSING", "requirement": "REQ-PREFLIGHT", "given": "workflow에 필요한 AI CLI가 PATH에 없다", "when": "agent나 init을 시작한다", "then": "기준 검사와 모델 호출 전에 agent_missing으로 중단한다"},
+    {"id": "SCN-LOCK-CONCURRENT", "requirement": "REQ-LOCK", "given": "다른 run·agent·init이 실행 중이다", "when": "같은 프로젝트에서 run·agent·init을 시작한다", "then": "project_locked로 거절하고 증거와 무결성 표시를 바꾸지 않는다"},
+    {"id": "SCN-LOCK-NESTED", "requirement": "REQ-LOCK", "given": "agent나 init이 잠금을 가진 채 검증 CLI를 호출한다", "when": "검증 CLI와 검사 명령이 실행된다", "then": "검증 CLI는 같은 잠금 아래에서 실행되고 AI 도구와 검사 명령은 잠금을 빌리지 못한다"},
+    {"id": "SCN-LOCK-RELEASE", "requirement": "REQ-LOCK", "given": "잠금을 가진 프로세스가 강제 종료되었다", "when": "새 명령을 시작한다", "then": "운영체제가 해제한 잠금을 바로 얻는다"}
   ],
   "checks": [
     {
-      "id": "CHK-LINK", "kind": "acceptance", "scenarios": ["SCN-VALID-TRACE", "SCN-INVALID-TRACE"],
+      "id": "CHK-LINK", "kind": "acceptance", "scenarios": ["SCN-VALID-TRACE", "SCN-INVALID-TRACE", "SCN-SELF-TRACE"],
       "timeout_seconds": 120,
       "command": ["{python}", "-B", "-m", "unittest", "-v",
         "tests.test_cli.HarnessTests.test_valid_links",
@@ -52,7 +69,8 @@
         "tests.test_cli.HarnessTests.test_uncovered_requirement",
         "tests.test_cli.HarnessTests.test_invalid_configuration",
         "tests.test_cli.HarnessTests.test_invalid_paths",
-        "tests.test_cli.HarnessTests.test_malformed_json"]
+        "tests.test_cli.HarnessTests.test_malformed_json",
+        "tests.test_cli.HarnessTests.test_every_repository_test_is_linked_to_a_check"]
     },
     {
       "id": "CHK-RUN", "kind": "acceptance", "scenarios": ["SCN-RUN-PASS", "SCN-RUN-FAIL"],
@@ -82,8 +100,50 @@
         "tests.test_cli.HarnessTests.test_inputs_changed_during_run",
         "tests.test_cli.HarnessTests.test_corrupt_history"]
     },
-    {"id": "CHK-AGENT", "kind": "acceptance", "scenarios": ["SCN-AGENT-SELECT", "SCN-AGENT-CYCLE", "SCN-AGENT-SCOPE", "SCN-AGENT-RETRY", "SCN-AGENT-QUESTION", "SCN-AGENT-REGRESSION", "SCN-AGENT-PROTOCOL"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_agent"]},
-    {"id": "CHK-ROLES", "kind": "acceptance", "scenarios": ["SCN-ROLES-CYCLE", "SCN-ROLES-REVIEW", "SCN-ROLES-EVIDENCE", "SCN-ROLES-BOUNDARY", "SCN-ROLES-GREEN", "SCN-ROLES-PROTOCOL"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_roles"]},
-    {"id": "CHK-INIT", "kind": "acceptance", "scenarios": ["SCN-INIT-GENERATE", "SCN-INIT-RED", "SCN-INIT-PRESERVE", "SCN-INIT-QUESTION", "SCN-INIT-HANDOFF"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_init"]}
+    {"id": "CHK-AGENT", "kind": "acceptance", "scenarios": ["SCN-AGENT-SELECT", "SCN-AGENT-CYCLE", "SCN-AGENT-SCOPE", "SCN-AGENT-RETRY", "SCN-AGENT-QUESTION", "SCN-AGENT-REGRESSION", "SCN-AGENT-PROTOCOL", "SCN-AGENT-DIAGNOSTIC"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_agent", "tests.test_hardening.BoundaryTests.test_red_diagnostic_includes_ids_reasons_and_evidence"]},
+    {"id": "CHK-ROLES", "kind": "acceptance", "scenarios": ["SCN-ROLES-CYCLE", "SCN-ROLES-REVIEW", "SCN-ROLES-EVIDENCE", "SCN-ROLES-BOUNDARY", "SCN-ROLES-GREEN", "SCN-ROLES-PROTOCOL", "SCN-ROLES-RULES"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_roles", "tests.test_agent.CodexAdapterTests.test_prompts_forbid_unverified_claims"]},
+    {"id": "CHK-INIT", "kind": "acceptance", "scenarios": ["SCN-INIT-GENERATE", "SCN-INIT-RED", "SCN-INIT-PRESERVE", "SCN-INIT-QUESTION", "SCN-INIT-HANDOFF"], "timeout_seconds": 180, "command": ["{python}", "-B", "-m", "unittest", "-v", "tests.test_init", "tests.test_hardening.InitBoundaryTests.test_scaffold_red_diagnostic_reports_invalid_execution"]},
+    {
+      "id": "CHK-GUARD", "kind": "acceptance", "scenarios": ["SCN-GUARD-SCOPE", "SCN-GUARD-EVIDENCE", "SCN-GUARD-VERIFIER"],
+      "timeout_seconds": 180,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_hardening.BoundaryTests.test_untracked_test_runner_shadow_is_rejected_before_verification",
+        "tests.test_hardening.BoundaryTests.test_bytecode_cache_outside_allowed_paths_is_not_a_blind_spot",
+        "tests.test_hardening.BoundaryTests.test_bytecode_cache_inside_allowed_paths_is_rejected",
+        "tests.test_hardening.BoundaryTests.test_untracked_existing_file_deletion_is_rejected_even_on_provider_error",
+        "tests.test_hardening.BoundaryTests.test_readonly_claude_cannot_add_untracked_file",
+        "tests.test_hardening.BoundaryTests.test_forged_evidence_stops_agent_and_invalidates_history",
+        "tests.test_hardening.BoundaryTests.test_deleted_evidence_is_detected_on_failure",
+        "tests.test_hardening.BoundaryTests.test_old_green_history_cannot_override_current_red",
+        "tests.test_hardening.BoundaryTests.test_project_module_does_not_replace_verifier",
+        "tests.test_hardening.InitBoundaryTests.test_untracked_scaffold_file_is_rejected",
+        "tests.test_hardening.InitBoundaryTests.test_init_protects_outer_evidence",
+        "tests.test_hardening.InitBoundaryTests.test_init_protects_draft_run_history_too",
+        "tests.test_hardening.ExecutionBoundaryTests.test_checks_cannot_forge_history",
+        "tests.test_hardening.ExecutionBoundaryTests.test_verifier_ignores_project_sitecustomize_from_pythonpath"]
+    },
+    {
+      "id": "CHK-RECOVERY", "kind": "acceptance", "scenarios": ["SCN-RECOVERY-REPAIR", "SCN-RECOVERY-SIGNAL"],
+      "timeout_seconds": 180,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_hardening.RepairTests",
+        "tests.test_hardening.BoundaryTests.test_sigterm_persists_interruption_and_restores_handler",
+        "tests.test_hardening.ExecutionBoundaryTests.test_sigterm_during_checks_saves_failed_interrupted_result",
+        "tests.test_hardening.ExecutionBoundaryTests.test_verifier_timeout_cleans_up_process_tree"]
+    },
+    {
+      "id": "CHK-PREFLIGHT", "kind": "acceptance", "scenarios": ["SCN-DOCTOR", "SCN-PREFLIGHT-MISSING"],
+      "timeout_seconds": 180,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_hardening.DoctorTests",
+        "tests.test_hardening.ProviderPreflightTests",
+        "tests.test_hardening.ExecutionBoundaryTests.test_public_doctor_does_not_load_required_manifest"]
+    },
+    {
+      "id": "CHK-LOCK", "kind": "acceptance", "scenarios": ["SCN-LOCK-CONCURRENT", "SCN-LOCK-NESTED", "SCN-LOCK-RELEASE"],
+      "timeout_seconds": 180,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_lock"]
+    }
   ]
 }

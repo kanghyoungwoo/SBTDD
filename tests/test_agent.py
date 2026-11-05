@@ -1,5 +1,8 @@
 import json
+import os
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -23,7 +26,8 @@ class AgentTests(unittest.TestCase):
         self.save()
 
     def run_with(self, action, **kwargs):
-        with patch("harness.agent.invoke_codex", side_effect=action) as agent:
+        with patch("harness.agent.invoke_codex", side_effect=action) as agent, \
+                patch("harness.agent.require_providers"):
             result = run_agent(self.root, self.manifest, **kwargs)
         stored = self.root / result["record"]
         self.assertEqual(json.loads(stored.read_text(encoding="utf-8")), result)
@@ -213,9 +217,20 @@ class AgentTests(unittest.TestCase):
 
     def test_public_cli_skips_ai_for_passed_target(self):
         (self.root / "logic.py").write_text("VALUE = 2\n", encoding="utf-8")
-        result = self.cli("agent", "--requirement", "REQ-1")
+        tools = tempfile.TemporaryDirectory()
+        self.addCleanup(tools.cleanup)
+        called = Path(tools.name) / "called"
+        if os.name == "nt":
+            (Path(tools.name) / "codex.bat").write_text(f'@echo called> "{called}"\r\n@exit /b 1\r\n')
+        else:
+            fake = Path(tools.name) / "codex"
+            fake.write_text(f'#!/bin/sh\ntouch "{called}"\nexit 1\n')
+            fake.chmod(0o755)
+        result = self.cli("agent", "--requirement", "REQ-1",
+                          env={"PATH": tools.name + os.pathsep + os.environ.get("PATH", "")})
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["reason"], "already_passed")
+        self.assertFalse(called.exists(), "a passed target must not start Codex")
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -243,6 +258,13 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertIn("REQ-1", process.communicate.call_args.kwargs["input"])
         self.assertTrue((self.directory / "prompt.txt").exists())
         self.assertTrue((self.directory / "response.json").exists())
+
+    def test_prompts_forbid_unverified_claims(self):
+        from harness.agent import INSTRUCTIONS, SCAFFOLD_INSTRUCTIONS
+        from harness.spec import SPEC_INSTRUCTIONS
+        self.assertIn("report only what you changed and what you actually observed", INSTRUCTIONS)
+        self.assertIn("do not claim unverified results", SCAFFOLD_INSTRUCTIONS)
+        self.assertIn("explicit assumption the user can review", SPEC_INSTRUCTIONS)
 
     def test_malformed_response_is_rejected(self):
         for output in ["not json", json.dumps({"outcome": "continue"}),

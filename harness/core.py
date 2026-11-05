@@ -9,6 +9,7 @@ import time
 import uuid
 
 from .guard import changed_paths, check_integrity, mark_integrity_violation, plain_path, tree_snapshot
+from .lock import environment, project_lock
 from .processes import interrupt_on_term, run_command
 
 
@@ -169,7 +170,7 @@ def execute_check(root, check):
         process = run_command(
             command, cwd=root, text=True, encoding="utf-8", errors="replace",
             timeout=check.get("timeout_seconds", 30),
-            env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1"),
+            env=environment(PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1"),
         )
         result.update(exit_code=process.returncode, stdout=process.stdout, stderr=process.stderr,
                       status="passed" if process.returncode == 0 else "failed")
@@ -185,13 +186,18 @@ def execute_check(root, check):
 
 @interrupt_on_term
 def run_checks(root, manifest, before, requirement=None):
+    if requirement is not None:
+        require(any(r["id"] == requirement for r in manifest["requirements"]),
+                f"Unknown requirement: {requirement}")
+    with project_lock(root, "run"):
+        return record_checks(root, manifest, before, requirement)
+
+
+def record_checks(root, manifest, before, requirement):
     try:
         check_integrity(root)
     except ValueError as error:
         raise HarnessError(str(error)) from error
-    if requirement is not None:
-        require(any(r["id"] == requirement for r in manifest["requirements"]),
-                f"Unknown requirement: {requirement}")
     scenario_ids = {s["id"] for s in manifest["scenarios"]
                     if requirement is None or s["requirement"] == requirement}
     checks = [c for c in manifest["checks"] if scenario_ids.intersection(c["scenarios"])]

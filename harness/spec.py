@@ -4,9 +4,10 @@ import re
 import sys
 import uuid
 
-from .agent import (AgentError, guarded_invoke, invoke_codex, red_details,
+from .agent import (AgentError, guarded_invoke, invoke_codex, red_details, require_providers,
                     validate_response, verification_cli, write_json)
 from .guard import check_integrity, plain_path
+from .lock import project_lock
 from .processes import interrupt_on_term
 from .claude import invoke_claude
 from .core import HarnessError, fields, fingerprint, input_files, is_text, load_manifest, require
@@ -46,7 +47,16 @@ If business rules, required dependencies, or the chosen Python environment need 
 return needs_input with a precise question instead of inventing decisions. Naming and simple
 internal organization are implementation choices you may make. Keep question empty on continue.
 The harness will generate one fixed unittest check and test filename for each scenario.
+Do not present guesses as facts: anything the brief does not state is either asked as a question
+or written in the design as an explicit assumption the user can review.
 Return schema-valid JSON; continue requires a title, substantive design, requirements and scenarios.
+"""
+
+
+GITIGNORE = """# Harness 실행 기록에는 프롬프트, AI 응답, 로그가 들어 있으므로 커밋하지 않습니다.
+.harness/
+__pycache__/
+.venv/
 """
 
 
@@ -99,16 +109,28 @@ def render_spec(spec):
     return "\n".join(lines)
 
 
-def is_stub_red(root, result):
-    if result["status"] != "failed" or result["reason"] != "exit_code" or result["exit_code"] == 0:
-        return False
+def stub_red_problem(root, result):
+    """Return None for a valid source-stub Red, otherwise why the check does not qualify."""
+    if result["reason"] != "exit_code":
+        return result["reason"]
     output = result["stderr"]
     if "Failed to import test module" in output or "unittest.loader._FailedTest" in output:
-        return False
-    ran = re.search(r"\bRan ([1-9]\d*) tests?\b", output)
-    errors = re.search(r"(?m)^FAILED \(errors=([1-9]\d*)\)\s*$", output)
-    if not ran or not errors or ran[1] != errors[1]:
-        return False
+        return "import_error"
+    ran = re.search(r"\bRan (\d+) tests?\b", output)
+    if not ran or ran[1] == "0":
+        return "no_tests"
+    if result["status"] != "failed" or result["exit_code"] == 0:
+        return "not_failing"
+    summary = re.search(r"(?m)^FAILED \(([^)]*)\)\s*$", output)
+    if not summary:
+        return "unrecognized_output"
+    counts = dict(re.findall(r"([a-z][a-z ]*)=(\d+)", summary[1]))
+    if counts.get("failures"):
+        return "assertion_failures"
+    if counts.keys() != {"errors"}:
+        return "unexpected_outcomes"
+    if counts["errors"] != ran[1]:
+        return "partial_errors"
     source_errors = 0
     last_file = None
     for match in re.finditer(r'(?m)^  File "([^"]+)", line \d+.*$|^NotImplementedError(?::[^\n]*)?\s*$', output):
@@ -116,7 +138,7 @@ def is_stub_red(root, result):
             last_file = Path(match[1])
         elif last_file is not None and last_file.resolve().is_relative_to(root / "src"):
             source_errors += 1
-    return source_errors == int(ran[1])
+    return None if source_errors == int(ran[1]) else "not_source_stub"
 
 
 @interrupt_on_term
@@ -130,18 +152,26 @@ def run_init(root, brief_path, timeout_seconds=300):
         raise HarnessError("brief must be UTF-8 text") from error
     require(is_text(brief), "brief must contain a nonempty requirement")
     require(brief_path.parent != root or brief_path.name.casefold() not in
-            {"spec.md", "harness.json", "src", "tests", ".harness"},
+            {"spec.md", "harness.json", "src", "tests", ".harness", ".gitignore"},
             "The brief uses a reserved project name; use BRIEF.md or a file outside the project")
     plain_path(root)
     root.mkdir(parents=True, exist_ok=True)
     check_integrity(root)
+    # Refuse a non-empty target before the lock creates .harness inside it.
+    require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
+    with project_lock(root, "init"):
+        return initialize(root, brief_path, brief_bytes, brief, timeout_seconds)
 
-    def empty_project():
-        return all(path.name == ".harness" and path.is_dir() and not path.is_symlink()
-                   or path == brief_path and path.is_file() and not path.is_symlink()
-                   for path in root.iterdir())
 
-    require(empty_project(), "init requires an empty project (the brief and .harness history may exist)")
+def empty_project(root, brief_path):
+    return all(path.name == ".harness" and path.is_dir() and not path.is_symlink()
+               or path == brief_path and path.is_file() and not path.is_symlink()
+               for path in root.iterdir())
+
+
+def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
+    check_integrity(root)
+    require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
     started = datetime.now(timezone.utc)
     session_id = started.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
     directory = root / ".harness" / "init-runs" / session_id
@@ -183,6 +213,7 @@ def run_init(root, brief_path, timeout_seconds=300):
 
     save()
     try:
+        require_providers(["claude", "codex"])
         spec = call("spec", "claude", {"phase": "spec", "brief": brief}, invoke_claude, validate_spec)
         if list(draft.iterdir()) != [draft / "BRIEF.md"] or (draft / "BRIEF.md").read_bytes() != brief_bytes:
             return finish("needs_input", "scope_changed", message="Claude must not modify the draft project.")
@@ -205,16 +236,18 @@ def run_init(root, brief_path, timeout_seconds=300):
         if not red["stable"]:
             return finish("needs_input", "inputs_changed", message="Inputs changed while checking the scaffold.")
         check_ids = {check["id"] for check in manifest["checks"]}
-        observed = {r["id"] for r in red["results"] if is_stub_red(draft, r)}
+        problems = {r["id"]: stub_red_problem(draft, r) for r in red["results"]}
+        observed = {key for key, problem in problems.items() if problem is None}
         if set(response["red_check_ids"]) != check_ids or observed != check_ids:
             return finish("needs_input", "scaffold_not_red",
                           message=f"Expected source-stub Red {sorted(check_ids)}; observed {sorted(observed)}. Each check must execute assertions reaching NotImplementedError in src.",
                           declared_red_check_ids=response["red_check_ids"],
+                          stub_red_problems={key: problem for key, problem in problems.items() if problem},
                           **red_details(red, check_ids, observed,
                                         (draft / ".harness" / "runs" / f"{red['run_id']}.json").relative_to(root).as_posix()))
         if brief_path.read_bytes() != brief_bytes:
             return finish("needs_input", "brief_changed", message="The brief changed during generation; regenerate from the updated brief.")
-        if not empty_project():
+        if not empty_project(root, brief_path):
             return finish("needs_input", "project_changed", message="Files were added to the target project during generation.")
         artifacts = []
         for source in input_files(draft, manifest):
@@ -228,6 +261,10 @@ def run_init(root, brief_path, timeout_seconds=300):
                 with target.open("xb") as stream:
                     stream.write(source.read_bytes())
             artifacts.append(relative.as_posix())
+        # Not a tracked input: ignoring evidence must not change the verified fingerprint.
+        with (root / ".gitignore").open("xb") as stream:
+            stream.write(GITIGNORE.encode("utf-8"))
+        artifacts.append(".gitignore")
         current = fingerprint(root, manifest)
         if current != red["fingerprint_after"]:
             return finish("needs_input", "project_changed", message="Published files no longer match the verified scaffold.")
