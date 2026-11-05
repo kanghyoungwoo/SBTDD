@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import zoneinfo
 from pathlib import Path
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Callable
 
 from .models import (
@@ -153,6 +153,24 @@ def main(
             return 0
         except (ConfigError, ValueError, OSError, RuntimeError,
                 sqlite3.Error) as exc:
+            err.write(f"error: {exc}\n")
+            return 2
+        finally:
+            if store is not None:
+                store.close()
+
+    if args.command == "status":
+        store = None
+        try:
+            config = load_config(args.config)
+            db = _cfg_get(config.raw, "paths.database")
+            if not isinstance(db, str) or not db:
+                raise ConfigError("paths.database is required")
+            store = Store.open(db)
+            out.write(json.dumps(get_status(store), ensure_ascii=False,
+                                 default=str) + "\n")
+            return 0
+        except (ConfigError, OSError, RuntimeError, sqlite3.Error) as exc:
             err.write(f"error: {exc}\n")
             return 2
         finally:
@@ -1492,7 +1510,49 @@ def _is_deposit_day(conn, raw, d: dt.date) -> bool:
 
 
 def get_status(store: Store) -> dict:
-    raise NotImplementedError("get_status")
+    conn = store._conn
+    total_cost = Decimal(0)
+    for (cost,) in conn.execute(
+            "SELECT fill_cost FROM orders WHERE status = 'FILLED'"
+            " AND fill_cost IS NOT NULL").fetchall():
+        total_cost += Decimal(cost)
+    filled = Decimal(0)
+    for kind, amount in conn.execute(
+            "SELECT kind, amount FROM position_ledger ORDER BY id").fetchall():
+        a = Decimal(amount)
+        if kind == "SPLIT":
+            filled = filled * a
+        elif kind == "FILL":
+            filled = filled + a
+    average = None
+    if filled > 0:
+        average = str((total_cost / filled).quantize(
+            Decimal("0.0001"), rounding=ROUND_HALF_UP))
+    recent = [
+        {
+            "trade_date": o.trade_date.isoformat(),
+            "rule_id": o.rule_id,
+            "status": o.status,
+            "quantity": str(o.quantity),
+            "limit_price": str(o.limit_price),
+            "fill_price": None if o.fill_price is None else str(o.fill_price),
+        }
+        for o in store.list_orders()[:5]
+    ]
+    row = conn.execute(
+        "SELECT at, exit_code, reasons FROM run_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    last_run = None
+    if row is not None:
+        last_run = {"at": row[0], "exit_code": int(row[1]),
+                    "reasons": row[2].split(",") if row[2] else []}
+    return {
+        "shares": str(store.holdings()),
+        "average_cost_usd": average,
+        "recent_orders": recent,
+        "active_halts": store._active_halts(),
+        "last_run": last_run,
+    }
 
 
 def record_adjustment(store: Store, shares: Decimal, reason: str) -> None:
