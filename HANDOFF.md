@@ -35,12 +35,12 @@ python3 -B -m harness --root "$PWD/projects/qqq-accumulator" doctor
 ```bash
 python3 -B -m harness --root "$PWD/projects/qqq-accumulator" run
 ```
-→ `passed`, 60/60 체크.
+→ `passed`, 66/66 체크.
 
 ```bash
 (cd projects/qqq-accumulator && python3 -B -m unittest discover -s tests)
 ```
-→ QQQ 테스트 62개 통과.
+→ QQQ 테스트 72개 통과.
 
 ## 3. 지금까지 한 일
 
@@ -77,6 +77,40 @@ brief의 구현 순서 가운데 1~2단계(백테스트와 기준선, 주문 상
   - live 단계는 거부한다(SCN-GRD-006).
   - 실제 증권사 어댑터는 아직 없다(SCN-GRD-007).
 
+### 3.3 매도 실험 규칙 ma_band (REQ-BT-004, 2026-11-05 추가)
+
+사용자 질문 "비쌀 때 팔고 쌀 때 사면 더 모을 수 있지 않나?"를 숫자로 확인하려고 **백테스트 전용** 규칙을 넣었다.
+운영 매도는 여전히 없다. Broker에 매도 메서드가 없고, `operating_rule`로 지정하면 `run`이 CONFIG_ERROR로 거부한다.
+이 요구사항은 하네스 agent가 아니라 이 세션에서 직접 구현했다. 계약(`harness.json`, `SPEC.md`)과 테스트
+061~066은 함께 추가했고, 하네스 `run`으로 66/66 체크 통과를 확인했다.
+
+- 규칙: 분할 조정 N일 단순 이동평균(SMA)을 증분으로 계산한다.
+  - 종가가 SMA×(1+sell_above_pct%) 이상이면 보유분의 sell_fraction_pct%를 판다. T+1 종가에 체결하며 지정가 여유가 적용된다.
+  - 판 뒤에는 종가가 SMA×(1+rebuy_at_or_below_pct%) 이하가 될 때까지 현금으로 기다린다(입금도 사지 않음). 조건이 맞으면 전액 다시 산다.
+- 비용 모형(가정, SPEC §6):
+  - 매도 수수료를 반영한다.
+  - 평균 원가 기준으로 양도차익을 계산한다.
+  - 연간 기본공제 후 세율을 적용한다. 세금은 다음 해 첫 봉에 납부하며, 미납분은 재투자하지 않는다.
+  - 달러 기준이며, 환차손익과 5월 신고 시점은 반영하지 않는다.
+- 설정: rules에 ma_band가 있으면 다음 값이 필수다.
+
+  ```toml
+  [sell_sim]
+  sell_fee_pct = 0.25            # 계좌의 실제 해외주식 수수료로 바꾼다
+  capital_gains_tax_pct = 22     # 양도소득세 + 지방세
+  annual_exemption_usd = 1800    # 연 250만 원 공제를 달러로 환산한 값
+  ```
+- 규칙 예시 파일: `projects/qqq-accumulator/docs/band-rules.example.json`(200일선 +20% 절반 매도 등 3개)
+- 결과 JSON의 규칙별 지표에 `sell_count`, `realized_gain_usd`, `tax_usd`가 추가됐다.
+- 테스트로 확인한 성질:
+  - 매도 뒤 가격이 내려오면 주수가 늘어난다(1주 → 1.333333주).
+  - 세금 22%가 붙으면 늘어나는 폭이 줄어든다(1.284444주).
+  - 매도 뒤 가격이 계속 오르면 기준선보다 주수가 줄어든다(환산 0.8주 대 1주).
+  - 분할로 가격이 반이 돼도 재매수 신호로 쓰지 않는다.
+  - 공제는 해마다 따로 적용된다.
+- **아직 실데이터로 돌려 보지 않았다.** 이 저장소에는 실제 QQQ 일봉 CSV가 없고, 이 세션 네트워크에서
+  stooq·Yahoo가 막혀 있었다. 아래 5.2를 참고한다.
+
 ## 4. 확정된 결정
 
 | 항목 | 결정 |
@@ -105,7 +139,39 @@ KIS API 세부 내용(서버, TR ID, 필드, 미확인 항목)은 `projects/qqq-
 4. 텔레그램 봇을 만든다(BotFather). 토큰과 chat id는 4단계에서 환경 변수로 쓴다.
 5. ThinkPad에 Ubuntu와 개발 환경을 설치하고, i7-7700 실험 PC를 준비한다.
 
-### 5.2 3a단계: KIS 모의투자 연결 (다음 코딩 작업)
+### 5.2 매도 실험 백테스트를 실데이터로 실행 (데이터만 있으면 바로 가능)
+
+1. 실제 QQQ 데이터를 준비한다.
+   - 일봉 CSV: `date,open,high,low,close,volume,split_factor,dividend`. 원시 가격으로 1999년 이후 전체를 쓴다.
+     2000-03-20 2:1 분할과 배당 포함.
+   - 같은 기간 거래일 달력 CSV: `date,is_open,close_time`.
+   - KRW 입금으로 시험하려면 환율 CSV도 준비한다. 형식은 `projects/qqq-accumulator/SPEC.md` §3에 있다.
+   - 출처 후보: KIS 일봉 API(3a 이후), 또는 직접 내려받은 CSV. 파일 해시가 결과 JSON에 기록된다.
+2. 실제 입금 주기와 금액, 수수료, `sell_sim` 값, 채택 기준(holdout 기간, 롤링 창, 최소 초과율)을 설정 파일에 넣는다.
+3. `projects/qqq-accumulator`에서 다음 명령을 실행한다(진입점은 `src/__main__.py`).
+
+   ```bash
+   python3 -B -m src --config CONFIG import-data --file calendar.csv
+   ```
+
+   ```bash
+   python3 -B -m src --config CONFIG import-data --file bars.csv
+   ```
+
+   ```bash
+   python3 -B -m src --config CONFIG backtest --rules docs/band-rules.example.json
+   ```
+
+4. 볼 것:
+   - 평가 구간의 `final_shares_diff_vs_baseline`, `equivalent_shares_diff_vs_baseline`
+   - 롤링 창에서 기준선 이상인 비율(`rolling`)
+   - 세금(`tax_usd`)과 매도 횟수
+5. 매개변수를 여러 번 바꿔 보면 평가 구간에 과적합된다. 매개변수는 조정 구간(tuning) 결과만 보고 정하고,
+   평가 구간은 마지막에 한 번만 본다.
+6. 채택 기준을 넘더라도 운영에 넣으려면 brief의 "매도 제외"를 사용자가 직접 바꿔야 한다.
+   그 경우 실계좌 매도 주문, 세금 기록, 보유 수량 대조를 새 요구사항으로 설계한다. 지금은 계획에 없다.
+
+### 5.3 3a단계: KIS 모의투자 연결 (다음 코딩 작업)
 
 먼저 `docs/kis-api-notes.md`의 내용을 KIS Developers 공식 문서와 대조한다.
 brief 규칙에 따라, 문서가 다르면 구현을 멈추고 질문한다. 그다음 요구사항과 시나리오를 `harness.json`에
@@ -123,13 +189,13 @@ brief 규칙에 따라, 문서가 다르면 구현을 멈추고 질문한다. �
 - 일봉(HHDFS76240000, EXCD `NAS`)과 확정 권리(CTRGT011R)를 갱신한다.
 - 실계좌 주문은 계속 막는다. 기본 테스트는 네트워크 없이 실행한다. HTTP 계층은 가짜 전송 객체로 테스트한다.
 
-### 5.3 3b단계: 실계좌 LOC (모의 운영 확인 뒤)
+### 5.4 3b단계: 실계좌 LOC (모의 운영 확인 뒤)
 
 - TTTT1002U, ORD_DVSN 34(LOC)를 쓴다.
 - SCN-GRD-006(live 거부)과 SCN-GRD-007(어댑터 없음)은 계약과 테스트를 함께 고친다.
 - 단계는 사용자가 설정 파일에서 직접 올린다. 첫 live 운영은 1회 한도와 월 한도를 소액으로 낮춰 LOC 체결을 확인한다.
 
-### 5.4 4단계: 알림과 스케줄
+### 5.5 4단계: 알림과 스케줄
 
 - 텔레그램 Notifier:
   - 거래일마다 요약 1건을 보낸다. 주문이 없는 날도 보낸다.
@@ -137,7 +203,7 @@ brief 규칙에 따라, 문서가 다르면 구현을 멈추고 질문한다. �
   - 알림이 실패해도 주문 상태는 바뀌지 않아야 한다.
 - systemd service와 timer(15분 주기, 단발 프로세스), 운영 서버 설정. brief의 macOS/launchd 문구도 고친다.
 
-### 5.5 이후 (별도 프로젝트)
+### 5.6 이후 (별도 프로젝트)
 
 - 자산 현황 웹: 읽기 전용, VPN 안에서만 접근, PWA. 목표 배분은 현금 30% / QQQ 50% / HFT 20%다.
 - HFT: 거래소를 먼저 정한 뒤 Linux x86 실험 PC에서 C++로 진행한다. QQQ 프로그램과는 분리한다.

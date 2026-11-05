@@ -54,6 +54,12 @@ class Rule:
     id: str
     type: str
     threshold_usd: Decimal | None = None
+    # ma_band (backtest only): sell when close >= MA*(1+sell_above_pct/100),
+    # buy back when close <= MA*(1+rebuy_at_or_below_pct/100).
+    ma_days: int | None = None
+    sell_above_pct: Decimal | None = None
+    sell_fraction_pct: Decimal | None = None
+    rebuy_at_or_below_pct: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,10 @@ class BacktestSettings:
     withholding_pct: Decimal
     limit_margin_pct: Decimal
     fractional: bool
+    # Used only by ma_band rules (simulated sells; no live sell exists).
+    sell_fee_pct: Decimal = Decimal(0)
+    capital_gains_tax_pct: Decimal = Decimal(0)
+    annual_exemption_usd: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -76,6 +86,7 @@ class Decision:
     rule_id: str
     quantity: Decimal
     limit_price: Decimal
+    side: str = "buy"
 
 
 @dataclass(frozen=True)
@@ -89,6 +100,9 @@ class RuleMetrics:
     unfilled_count: int
     final_shares_diff_vs_baseline: Decimal
     equivalent_shares_diff_vs_baseline: Decimal
+    sell_count: int = 0
+    realized_gain_usd: Decimal = Decimal(0)
+    tax_usd: Decimal = Decimal(0)
 
 
 @dataclass

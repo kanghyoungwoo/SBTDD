@@ -785,6 +785,54 @@ def _decide_amount(rule: Rule, bar: Bar, available: Decimal,
     raise ValueError(f"unknown rule type: {rule.type}")
 
 
+class SmaState:
+    """Incremental simple moving average over split-adjusted closes.
+
+    Past closes are restated in current-share terms on a split day, so a split
+    alone never moves the average relative to the price.
+    """
+
+    def __init__(self, days: int) -> None:
+        from collections import deque
+
+        self.days = days
+        self._window = deque()
+        self._sum = Decimal(0)
+
+    def update(self, close: Decimal, split_factor: Decimal) -> None:
+        if split_factor != 1 and self._window:
+            self._window = type(self._window)(v / split_factor
+                                              for v in self._window)
+            self._sum = sum(self._window, Decimal(0))
+        self._window.append(close)
+        self._sum += close
+        if len(self._window) > self.days:
+            self._sum -= self._window.popleft()
+
+    @property
+    def value(self) -> Decimal | None:
+        if len(self._window) < self.days:
+            return None
+        return self._sum / self.days
+
+
+def _decide_band(rule: Rule, ma: Decimal | None, bar: Bar, available: Decimal,
+                 is_deposit: bool, shares: Decimal, out: bool):
+    """Backtest-only ma_band decision: ("sell", None), ("buy", amount) or None."""
+    hundred = Decimal(100)
+    if out:
+        if (ma is not None and available > 0 and bar.close <=
+                ma * (1 + rule.rebuy_at_or_below_pct / hundred)):
+            return ("buy", available)
+        return None
+    if (ma is not None and shares > 0
+            and bar.close >= ma * (1 + rule.sell_above_pct / hundred)):
+        return ("sell", None)
+    if is_deposit and available > 0:
+        return ("buy", available)
+    return None
+
+
 def simulate(
     bars: list[Bar],
     rules: list[Rule],
@@ -828,7 +876,7 @@ def simulate(
 
     all_rules = [Rule("baseline", "baseline")] + list(rules)
     for r in all_rules[1:]:
-        if r.type not in ("baseline", "close_at_or_below"):
+        if r.type not in ("baseline", "close_at_or_below", "ma_band"):
             raise ValueError(f"unknown rule type: {r.type}")
 
     decide = _decide_amount
@@ -838,6 +886,10 @@ def simulate(
         states[r.id] = {
             "shares": zero, "cash": zero, "reserved": zero, "pending": None,
             "deposit": zero, "cost": zero, "unfilled": 0, "waiting": 0,
+            "out": False, "year": bars[0].date.year, "ytd_gain": zero,
+            "tax_unpaid": zero, "tax_paid": zero, "realized": zero,
+            "sells": 0,
+            "sma": SmaState(r.ma_days) if r.type == "ma_band" else None,
         }
     decisions: list[Decision] = []
 
@@ -857,6 +909,13 @@ def simulate(
                 deposit_usd = settings.deposit_amount
         for r in all_rules:
             st = states[r.id]
+            # 0. a new calendar year pays last year's capital gains tax
+            if bar.date.year != st["year"]:
+                st["cash"] -= st["tax_unpaid"]
+                st["tax_paid"] += st["tax_unpaid"]
+                st["tax_unpaid"] = zero
+                st["ytd_gain"] = zero
+                st["year"] = bar.date.year
             # 1. split
             if bar.split_factor != 1:
                 f = bar.split_factor
@@ -864,14 +923,42 @@ def simulate(
                 if not settings.fractional:
                     st["shares"] = q(st["shares"], "1", ROUND_DOWN)
                 if st["pending"] is not None:
-                    pq, pl = st["pending"]
+                    pq, pl, side = st["pending"]
                     pq = pq * f
                     if not settings.fractional:
                         pq = q(pq, "1", ROUND_DOWN)
-                    st["pending"] = (pq, pl / f)
+                    st["pending"] = (pq, pl / f, side)
             # 2. settle
+            if st["pending"] is not None and st["pending"][2] == "sell":
+                pq, pl, _ = st["pending"]
+                pq = min(pq, st["shares"])
+                if bar.close >= pl and pq > 0:
+                    proceeds = q(pq * bar.close, "0.01", ROUND_HALF_UP)
+                    fee = q(proceeds * settings.sell_fee_pct / hundred, "0.01",
+                            ROUND_CEILING)
+                    if pq == st["shares"]:
+                        basis = st["cost"]
+                    else:
+                        basis = q(st["cost"] * pq / st["shares"], "0.01",
+                                  ROUND_HALF_UP)
+                    gain = proceeds - fee - basis
+                    st["cash"] += proceeds - fee
+                    st["cost"] -= basis
+                    st["shares"] -= pq
+                    st["ytd_gain"] += gain
+                    st["realized"] += gain
+                    st["sells"] += 1
+                    st["out"] = True
+                    taxable = max(zero,
+                                  st["ytd_gain"] - settings.annual_exemption_usd)
+                    st["tax_unpaid"] = q(
+                        taxable * settings.capital_gains_tax_pct / hundred,
+                        "0.01", ROUND_CEILING)
+                else:
+                    st["unfilled"] += 1
+                st["pending"] = None
             if st["pending"] is not None:
-                pq, pl = st["pending"]
+                pq, pl, _ = st["pending"]
                 if bar.close <= pl:
                     cost = q(pq * bar.close, "0.01", ROUND_HALF_UP)
                     fee = q(cost * settings.buy_fee_pct / hundred, "0.01",
@@ -879,6 +966,7 @@ def simulate(
                     st["cash"] -= cost + fee
                     st["cost"] += cost + fee
                     st["shares"] += pq
+                    st["out"] = False
                 else:
                     st["unfilled"] += 1
                 st["pending"] = None
@@ -893,9 +981,29 @@ def simulate(
             if is_deposit:
                 st["cash"] += deposit_usd
                 st["deposit"] += deposit_usd
+            # 5. indicators
+            if st["sma"] is not None:
+                st["sma"].update(bar.close, bar.split_factor)
             # 6. decide
-            available = st["cash"] - st["reserved"]
-            amount = decide(r, bar, available, is_deposit)
+            available = st["cash"] - st["reserved"] - st["tax_unpaid"]
+            if r.type == "ma_band":
+                action = _decide_band(r, st["sma"].value, bar, available,
+                                      is_deposit, st["shares"], st["out"])
+                amount = zero
+                if action is not None and action[0] == "buy":
+                    amount = action[1]
+                elif action is not None:
+                    qty = qty_round(st["shares"] * r.sell_fraction_pct
+                                    / hundred)
+                    if qty > 0:
+                        limit = q(bar.close * (one - settings.limit_margin_pct
+                                               / hundred), "0.01",
+                                  ROUND_HALF_UP)
+                        decisions.append(
+                            Decision(bar.date, r.id, qty, limit, "sell"))
+                        st["pending"] = (qty, limit, "sell")
+            else:
+                amount = decide(r, bar, available, is_deposit)
             if amount > 0:
                 limit = q(bar.close * (one + settings.limit_margin_pct
                                        / hundred), "0.01", ROUND_HALF_UP)
@@ -903,16 +1011,18 @@ def simulate(
                     amount / (limit * (one + settings.buy_fee_pct / hundred)))
                 if qty > 0:
                     decisions.append(Decision(bar.date, r.id, qty, limit))
-                    st["pending"] = (qty, limit)
+                    st["pending"] = (qty, limit, "buy")
                     st["reserved"] = amount
             # 7. waiting
-            if st["cash"] - st["reserved"] > 0:
+            if st["cash"] - st["reserved"] - st["tax_unpaid"] > 0:
                 st["waiting"] += 1
 
     last_close = bars[-1].close
     raw = {}
     for r in all_rules:
         st = states[r.id]
+        # unpaid capital gains tax is a liability on the remaining cash
+        st["cash"] -= st["tax_unpaid"]
         eq = q(st["shares"] + st["cash"] / last_close, "0.000001",
                ROUND_DOWN)
         avg = (q(st["cost"] / st["shares"], "0.0001", ROUND_HALF_UP)
@@ -933,6 +1043,9 @@ def simulate(
             unfilled_count=st["unfilled"],
             final_shares_diff_vs_baseline=st["shares"] - base_shares,
             equivalent_shares_diff_vs_baseline=eq - base_eq,
+            sell_count=st["sells"],
+            realized_gain_usd=st["realized"],
+            tax_usd=st["tax_paid"] + st["tax_unpaid"],
         )
     decisions.sort(key=lambda d: d.date)
     return SimulationResult(metrics=metrics, decisions=decisions)
@@ -986,6 +1099,9 @@ def _load_rules(path) -> list[Rule]:
                 or rid in seen:
             raise ConfigError(f"invalid or duplicate rule id: {rid!r}")
         seen.add(rid)
+        if item.get("type") == "ma_band":
+            rules.append(_load_band_rule(rid, item))
+            continue
         if item.get("type") != "close_at_or_below":
             raise ConfigError(f"unknown rule type: {item.get('type')!r}")
         th = item.get("threshold_usd")
@@ -999,6 +1115,50 @@ def _load_rules(path) -> list[Rule]:
             raise ConfigError("threshold_usd must be positive")
         rules.append(Rule(rid, "close_at_or_below", thd))
     return rules
+
+
+def _rule_num(item: dict, key: str) -> Decimal:
+    value = item.get(key)
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        raise ConfigError(f"{key} must be a number")
+    try:
+        number = Decimal(value)
+    except Exception as exc:
+        raise ConfigError(f"{key} must be a number") from exc
+    if not number.is_finite():
+        raise ConfigError(f"{key} must be a number")
+    return number
+
+
+def _load_band_rule(rid: str, item: dict) -> Rule:
+    days = item.get("ma_days")
+    if isinstance(days, bool) or not isinstance(days, int) or days < 2:
+        raise ConfigError("ma_days must be an integer >= 2")
+    sell_above = _rule_num(item, "sell_above_pct")
+    fraction = _rule_num(item, "sell_fraction_pct")
+    rebuy = _rule_num(item, "rebuy_at_or_below_pct")
+    if not sell_above > 0:
+        raise ConfigError("sell_above_pct must be positive")
+    if not 0 < fraction <= 100:
+        raise ConfigError("sell_fraction_pct must be in (0, 100]")
+    if not -100 < rebuy < sell_above:
+        raise ConfigError(
+            "rebuy_at_or_below_pct must be above -100 and below sell_above_pct")
+    return Rule(rid, "ma_band", ma_days=days, sell_above_pct=sell_above,
+                sell_fraction_pct=fraction, rebuy_at_or_below_pct=rebuy)
+
+
+def _sell_sim_settings(raw: dict, settings: BacktestSettings) -> BacktestSettings:
+    from dataclasses import replace
+
+    return replace(
+        settings,
+        sell_fee_pct=_cfg_num(raw, "sell_sim.sell_fee_pct", ge=0, le=100),
+        capital_gains_tax_pct=_cfg_num(raw, "sell_sim.capital_gains_tax_pct",
+                                       ge=0, le=100),
+        annual_exemption_usd=_cfg_num(raw, "sell_sim.annual_exemption_usd",
+                                      ge=0),
+    )
 
 
 def _add_years(d: dt.date, n: int) -> dt.date:
@@ -1041,6 +1201,8 @@ def run_backtest(store: Store, rules_path, config: Config) -> dict:
     raw = config.raw
     rules = _load_rules(rules_path)
     settings = _backtest_settings(raw)
+    if any(r.type == "ma_band" for r in rules):
+        settings = _sell_sim_settings(raw, settings)
     holdout = _cfg_int(raw, "adoption.holdout_years")
     window_years = _cfg_int(raw, "adoption.rolling_window_years")
     min_out = _cfg_num(raw, "adoption.min_outperformance_pct")

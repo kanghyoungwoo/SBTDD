@@ -75,6 +75,10 @@
     {
       "id": "REQ-TEST-001",
       "description": "기본 테스트는 네트워크 없이 FakeBroker와 FakeNotifier로 실행된다."
+    },
+    {
+      "id": "REQ-BT-004",
+      "description": "백테스트 전용 ma_band 실험 규칙: 분할 조정 N일 이동평균보다 일정 비율 이상 오르면 보유 주식 일부를 T+1 종가로 판 것으로 시뮬레이션하고, 이동평균 기준 이하로 내려오면 그 현금을 다시 매수한다. 매도 수수료, 연간 공제 후 양도소득세를 반영하고 매도 횟수, 실현 손익, 세금을 지표에 추가한다. 운영(run)에서는 이 규칙을 쓸 수 없고 증권사 매도 기능도 만들지 않는다."
     }
   ],
   "scenarios": [
@@ -497,6 +501,48 @@
       "given": "socket.socket과 socket.create_connection을 호출하면 예외를 내도록 패치한 상태와 픽스처 F",
       "when": "run_once(now=2026-11-05 15:30 ET)를 실행하고 settle_close(2026-11-05, 98) 후 16:30 ET에 다시 실행",
       "then": "소켓 예외 없이 첫 결과 exit_code 0, 이후 주문 상태 FILLED"
+    },
+    {
+      "id": "SCN-BT-014",
+      "requirement": "REQ-BT-004",
+      "given": "make_bars 종가 100,100,100,120,120,90,90, 첫 거래일만 입금 100, 수수료·세금 0, 여유 0, fractional true, Rule band(ma_band, ma_days 3, sell_above 10, sell_fraction 100, rebuy_at_or_below 0)",
+      "when": "simulate(bars, [band], settings)",
+      "then": "band 판단은 1일 매수 1주@100, 4일 매도 1주@120, 6일 매수 1.333333주@90. band 최종 1.333333주, sell_count 1, realized_gain_usd 20, tax_usd 0. 기준선 1주, 차이 +0.333333"
+    },
+    {
+      "id": "SCN-BT-015",
+      "requirement": "REQ-BT-004",
+      "given": "SCN-BT-014와 같은 데이터에 capital_gains_tax_pct 22. (a) 공제 0 (b) annual_exemption_usd 25 (c) 종가 100,100,100,120,120,90,90,90,90,110,110,90, sell_fraction 50, 공제 15를 2025-12-01 시작(두 매도가 같은 해)과 2025-12-19 시작(해가 바뀜)으로 실행",
+      "when": "simulate(...)",
+      "then": "(a) tax_usd 4.40, 재매수 1.284444주, cash_usd 0. (b) tax_usd 0, 1.333333주. (c) 같은 해: 매도 2회, 실현 19.17, 세금 0.92. 해가 바뀜: 매도 2회, 세금 0"
+    },
+    {
+      "id": "SCN-BT-016",
+      "requirement": "REQ-BT-004",
+      "given": "종가 100,100,100,120,120,130,140,150, SCN-BT-014의 band 규칙",
+      "when": "simulate(...)",
+      "then": "band 최종 0주, cash_usd 120, 환산 0.8주, 기준선 대비 주수 -1, 환산 주수 -0.2"
+    },
+    {
+      "id": "SCN-BT-017",
+      "requirement": "REQ-BT-004",
+      "given": "종가 100,100,100,120,120,60,60,60, 6번째 봉 2:1 분할, rebuy_at_or_below -5",
+      "when": "simulate(...)",
+      "then": "매도 뒤 매수 판단 없음(분할로 가격이 반이 되어도 재매수 신호가 아님), band cash_usd 120, 기준선 2주"
+    },
+    {
+      "id": "SCN-BT-018",
+      "requirement": "REQ-BT-004",
+      "given": "SCN-BT-010의 DB와 rules 파일에 ma_band 규칙(ma_days 20, sell_above 15, fraction 50, rebuy 0). (a) sell_sim 설정 있음 (b) sell_sim 없음 (c) fraction 0, ma_days 1, rebuy ≥ sell_above, sell_above ≤0 중 하나",
+      "when": "main([\"--config\", 설정, \"backtest\", \"--rules\", rules])",
+      "then": "(a) 반환값 0, band 지표에 sell_count, realized_gain_usd, tax_usd 키. (b)(c) 반환값 2, stdout 비어 있음"
+    },
+    {
+      "id": "SCN-BT-019",
+      "requirement": "REQ-BT-004",
+      "given": "공통 운영 픽스처 F에서 operating_rule.type = \"ma_band\"",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "반환값 2, reasons [\"CONFIG_ERROR\"], place 호출 0, 주문 행 0"
     }
   ],
   "checks": [
@@ -1578,6 +1624,114 @@
         "tests",
         "-p",
         "test_scenario_060.py"
+      ]
+    },
+    {
+      "id": "CHK-061",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-014"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_061.py"
+      ]
+    },
+    {
+      "id": "CHK-062",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-015"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_062.py"
+      ]
+    },
+    {
+      "id": "CHK-063",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-016"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_063.py"
+      ]
+    },
+    {
+      "id": "CHK-064",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-017"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_064.py"
+      ]
+    },
+    {
+      "id": "CHK-065",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-018"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_065.py"
+      ]
+    },
+    {
+      "id": "CHK-066",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-019"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_066.py"
       ]
     }
   ]

@@ -1,0 +1,10 @@
+{
+  "rules": [
+    {"id": "band200_s20_f50", "type": "ma_band", "ma_days": 200,
+     "sell_above_pct": "20", "sell_fraction_pct": "50", "rebuy_at_or_below_pct": "0"},
+    {"id": "band200_s30_f100", "type": "ma_band", "ma_days": 200,
+     "sell_above_pct": "30", "sell_fraction_pct": "100", "rebuy_at_or_below_pct": "5"},
+    {"id": "band50_s10_f30", "type": "ma_band", "ma_days": 50,
+     "sell_above_pct": "10", "sell_fraction_pct": "30", "rebuy_at_or_below_pct": "0"}
+  ]
+}

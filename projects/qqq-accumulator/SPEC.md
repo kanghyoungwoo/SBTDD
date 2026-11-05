@@ -11,7 +11,8 @@ AGENTS.md: 프로젝트와 상위 디렉터리에 AGENTS.md가 없다(확인함)
 ## 0. 범위
 - 포함: CSV 가져오기(일봉·달력·환율), 백테스트(기준선 + "종가 X달러 이하 전액 매수" 규칙), 채택 판정, 단발 `run`(대조→안전 장치→판단→주문 의도 기록→FakeBroker 전송→체결 대조), `status`, `adjust`, Broker/Notifier 인터페이스와 FakeBroker/FakeNotifier.
 - 제외(다음 단계): 실제 증권사 어댑터, 텔레그램, OS 스케줄 등록, 동작 예시 14(토큰 재발급·키 로그 검사), 공유 계좌 예산 장부, R1·R2 지표, paper 통과 기준 판정(설정 키는 정의만 하고 이번 범위에서는 어떤 명령도 쓰지 않는다).
-- 영구 제외: 매도(매도 함수 없음), 공매도, 신용·미수, 레버리지 ETF, QQQ 외 종목, 분봉, 웹 UI, 환전 자동화, 세금 신고, 상주 데몬, 메시지 큐, DB 서버, 판단 경로의 LLM·이미지 분석.
+- 백테스트 전용 실험: ma_band 규칙(REQ-BT-004)은 "비쌀 때 팔고 쌀 때 다시 사면 주수가 늘어나는가"를 세금·수수료를 넣어 시뮬레이션만 한다. 운영 규칙으로 쓸 수 없고, 채택되더라도 운영에 넣으려면 사용자가 brief의 매도 제외를 먼저 바꿔야 한다.
+- 영구 제외: 운영 매도(증권사 매도 함수 없음), 공매도, 신용·미수, 레버리지 ETF, QQQ 외 종목, 분봉, 웹 UI, 환전 자동화, 세금 신고, 상주 데몬, 메시지 큐, DB 서버, 판단 경로의 LLM·이미지 분석.
 - 환경: Python ≥3.11, 표준 라이브러리만, unittest. 소스 `src/`, 테스트 `tests/`. 네트워크를 쓰지 않는다. SQLite는 STRICT 테이블을 지원하는 3.37 이상이어야 한다(미만이면 DB를 여는 명령은 종료 코드 2).
 
 ## 1. 수치 원칙(float 금지)
@@ -47,6 +48,8 @@ AGENTS.md: 프로젝트와 상위 디렉터리에 AGENTS.md가 없다(확인함)
 | `adoption.holdout_years`, `adoption.rolling_window_years` | 정수 ≥1 | backtest |
 | `adoption.min_outperformance_pct`, `adoption.min_rolling_ratio_pct` | 숫자 ≥0 / 0–100 | backtest |
 | `paper.clean_days_required` | 정수 ≥1 | (이번 범위 미사용) |
+| `sell_sim.sell_fee_pct`, `sell_sim.capital_gains_tax_pct` | 숫자 0–100 | backtest(rules에 ma_band가 있을 때만) |
+| `sell_sim.annual_exemption_usd` | 숫자 ≥0. 해외주식 양도소득 기본공제(연 250만 원)를 달러로 환산해 넣는다(가정) | 위와 같음 |
 | `operating_rule` | 테이블 `{type="baseline"}` 또는 `{type="close_at_or_below", threshold_usd=숫자}`. 없으면 baseline | run |
 
 키와 토큰은 환경 변수로만 받는다. 이번 범위에는 키를 쓰는 코드가 없다. 프로그램은 설정 파일에 쓰지 않으므로 단계를 올릴 수 없다.
@@ -74,8 +77,8 @@ DB 보유 수량 = 체결 수량 합 + adjust 합, 그리고 분할 적용 때 �
 - `Bar(date, open, high, low, close, volume, split_factor, dividend)`, `Rule(id, type, threshold_usd | None)`, `BacktestSettings(deposit_cycle, deposit_day, deposit_n, deposit_amount, currency, buy_fee_pct, fx_cost_pct, withholding_pct, limit_margin_pct, fractional)`.
 - `simulate(bars: list[Bar], rules: list[Rule], settings: BacktestSettings, fx_rates: dict[date, Decimal] | None = None) -> SimulationResult`
   - 기준선 `baseline`은 항상 포함되며 rules에 다시 넣지 않는다. 전제: bars는 날짜 오름차순이고 검증된 거래일 연속이다. KRW인데 입금일 환율이 없으면 `DataImportError`.
-  - `result.metrics[rule_id] -> RuleMetrics(final_shares, cash_usd, equivalent_shares, total_deposit_usd, average_cost_usd, cash_waiting_days, unfilled_count, final_shares_diff_vs_baseline, equivalent_shares_diff_vs_baseline)`.
-  - `result.decisions -> list[Decision(date, rule_id, quantity, limit_price)]`. 판단일(T) 순이며 수량 >0인 주문만 담는다.
+  - `result.metrics[rule_id] -> RuleMetrics(final_shares, cash_usd, equivalent_shares, total_deposit_usd, average_cost_usd, cash_waiting_days, unfilled_count, final_shares_diff_vs_baseline, equivalent_shares_diff_vs_baseline, sell_count, realized_gain_usd, tax_usd)`. 뒤의 세 값은 ma_band가 아니면 0이다. `BacktestSettings`에는 sell_fee_pct, capital_gains_tax_pct, annual_exemption_usd(기본 0)가 더 있다.
+  - `result.decisions -> list[Decision(date, rule_id, quantity, limit_price, side="buy"|"sell")]`. sell은 ma_band에만 있다. 판단일(T) 순이며 수량 >0인 주문만 담는다.
 - `evaluate_adoption(rule_eval_shares, baseline_eval_shares, rolling_pairs: list[tuple[Decimal, Decimal]], min_outperformance_pct, min_rolling_ratio_pct) -> AdoptionResult(adopted: bool, outperformance_pct: Decimal | None, rolling_ratio_pct: Decimal)`
 - `run_backtest(store, rules_path, config) -> dict` (JSON 직렬화 가능, 7절).
 - `compute_order(prev_close, limit_margin_pct, rule_amount, orderable_cash, per_order_limit, monthly_remaining, buy_fee_pct, fractional) -> OrderPlan(limit_price, quantity, amount, binding: str, reason: str | None)`. binding은 "RULE" / "CASH" / "PER_ORDER_LIMIT" / "MONTHLY_LIMIT"이다. 수량 0이면 reason이 붙는다: binding이 MONTHLY_LIMIT이면 "MONTHLY_LIMIT_REACHED", 아니면 "INSUFFICIENT_CASH".
@@ -96,6 +99,12 @@ DB 보유 수량 = 체결 수량 합 + adjust 합, 그리고 분할 적용 때 �
 5. 지표를 갱신한다.
 6. 규칙마다 판단해 D+1 LOC를 만든다. 지정가는 D 종가 기준이고, 수량은 이때 고정되며, 주문 금액만큼 현금을 묶는다.
 
+- ma_band(백테스트 전용 실험, REQ-BT-004): 규칙마다 ma_days일 단순 이동평균(SMA)을 5단계에서 증분 갱신한다. 분할일에는 창 안의 과거 종가를 비율로 나눠 현재 주식 기준으로 바꾼다. 판단(6단계):
+  - 매도 뒤 재매수 대기 중이면: SMA가 준비됐고 종가 ≤ SMA×(1+rebuy_at_or_below_pct/100)이며 사용 가능 현금이 있으면 전액 매수. 대기 중에는 입금일에도 사지 않는다. 매수가 체결되면 대기가 끝난다.
+  - 아니면: SMA가 준비됐고 보유 주수 >0이고 종가 ≥ SMA×(1+sell_above_pct/100)이면 보유 주수×sell_fraction_pct/100(소수점 미지원이면 내림)을 판다. 지정가는 D 종가×(1−지정가 여유)이고 D+1 종가 ≥ 지정가면 D+1 종가에 체결, 아니면 미체결 1회. 신호가 없으면 기준선처럼 입금일에 전액 매수한다.
+  - 매도 체결: 대금(0.01 반올림) − 매도 수수료(올림)가 현금에 들어온다. 원가는 평균 원가(매수 수수료 포함)로 비례해 뺀다. 실현 손익을 그해 누계에 더하고, 미납 세금 = max(0, 누계 − annual_exemption_usd) × 세율(0.01 올림)로 다시 계산한다. 미납 세금은 사용 가능 현금에서 빠진다.
+  - 새 해의 첫 봉(0단계)에서 전년 미납 세금을 현금에서 내고 누계를 0으로 돌린다. 시뮬레이션이 끝날 때 남은 미납 세금은 cash_usd에서 뺀다.
+  - 가정: 세금은 달러 기준이며 환차손익, 다른 종목과의 손익 통산, 신고 시점(5월)은 반영하지 않는다. 운영(run)의 operating_rule로는 쓸 수 없고 Broker에 매도 메서드는 없다.
 - 기준선: D가 입금일일 때 사용 가능 현금(묶이지 않은 현금) 전액. close_at_or_below: D의 원시 종가 ≤ threshold이고 사용 가능 현금이 있으면 전액. 백테스트에서는 안전 한도를 쓰지 않는다(가정).
 - 입금일: monthly는 매월 day 이후 첫 거래일이고, 그달에 없으면 그달 마지막 거래일이다. every_n_trading_days는 시뮬레이션 첫 거래일과 그 뒤 n 거래일마다이다. 운영에서는 anchor_date부터 센다.
 - 현금 대기 일수(가정): 6단계 뒤 묶이지 않은 현금 > 0인 거래일 수.
@@ -106,7 +115,7 @@ DB 보유 수량 = 체결 수량 합 + adjust 합, 그리고 분할 적용 때 �
 - 평가 구간은 날짜 > (마지막 봉 날짜 − holdout_years년)인 봉이다. 조정 구간은 그 앞 전체다. 구간마다 현금 0, 주식 0에서 따로 시뮬레이션한다.
 - 롤링 창은 전체 데이터에서 매월 첫 거래일에 시작하고, 끝은 (시작 + N년 − 1일) 이하의 마지막 거래일이다. 끝이 마지막 봉 날짜를 넘는 창은 뺀다. 데이터가 holdout 또는 창 하나보다 짧으면 종료 코드 2.
 - 채택(가정): 평가 구간 final_shares가 기준선보다 많고 (규칙−기준선)/기준선×100 ≥ min_outperformance_pct이다(기준선 0이면 규칙 >0이면 충족). 그리고 롤링 창 가운데 규칙 final_shares ≥ 기준선인 비율 ≥ min_rolling_ratio_pct이다. 채택된 규칙 중 평가 final_shares가 가장 큰 것(같으면 파일 순서)이 selected_rule이고, 없으면 "baseline"이다. 프로그램은 운영 규칙을 자동으로 바꾸지 않는다.
-- rules 파일(JSON): `{"rules": [{"id": "le60", "type": "close_at_or_below", "threshold_usd": "60"}]}`. 알 수 없는 type, id 중복, id "baseline", threshold ≤0이면 종료 코드 2.
+- rules 파일(JSON): `{"rules": [{"id": "le60", "type": "close_at_or_below", "threshold_usd": "60"}, {"id": "band", "type": "ma_band", "ma_days": 200, "sell_above_pct": "20", "sell_fraction_pct": "50", "rebuy_at_or_below_pct": "0"}]}`. 알 수 없는 type, id 중복, id "baseline", threshold ≤0이면 종료 코드 2. ma_band는 ma_days 정수 ≥2, sell_above_pct >0, 0 < sell_fraction_pct ≤ 100, −100 < rebuy_at_or_below_pct < sell_above_pct가 아니거나 sell_sim 설정이 없으면 종료 코드 2.
 
 ## 8. run 흐름 (`run_once`)
 뉴욕 날짜 D = now를 America/New_York으로 바꾼 날짜. 판단 봉 T = D보다 이전인 봉 중 가장 최근 봉.
@@ -128,7 +137,7 @@ DB 보유 수량 = 체결 수량 합 + adjust 합, 그리고 분할 적용 때 �
 `{"shares", "average_cost_usd", "recent_orders": [최신 5건 {trade_date, rule_id, status, quantity, limit_price, fill_price}], "active_halts": [고정 중단 사유], "last_run": {"at", "exit_code", "reasons"}|null}`
 
 ## 10. 가정(사용자 확인 필요) 요약
-1절 반올림, 3절 CSV 형식·헤더 판별·휴장일 봉 거부·달력 선행, 6절 입금 주기 형식·백테스트 안전 한도 미적용·분할 시 미결 주문 조정·현금 대기 일수 정의·threshold는 원시 종가, 7절 구간·창·채택 판정식, 8절 CLI dry-run도 어댑터가 없어 2·사유 우선순위와 종료 코드(휴장·시간대 밖·이미 주문·신호 없음·현금 부족은 0)·알림 중복 방지·일일 요약 시점·조기 폐장 시간대 이동·월 한도 산식·dry-run 행은 월 한도에서 제외, 9절 최근 주문 5건.
+1절 반올림, 3절 CSV 형식·헤더 판별·휴장일 봉 거부·달력 선행, 6절 ma_band 세금 모형(달러 기준·평균 원가·연간 공제·다음 해 첫 봉 납부), 6절 입금 주기 형식·백테스트 안전 한도 미적용·분할 시 미결 주문 조정·현금 대기 일수 정의·threshold는 원시 종가, 7절 구간·창·채택 판정식, 8절 CLI dry-run도 어댑터가 없어 2·사유 우선순위와 종료 코드(휴장·시간대 밖·이미 주문·신호 없음·현금 부족은 0)·알림 중복 방지·일일 요약 시점·조기 폐장 시간대 이동·월 한도 산식·dry-run 행은 월 한도에서 제외, 9절 최근 주문 5건.
 
 ## 11. 공통 운영 픽스처 F (시나리오가 참조)
 - 달력: 2026-10-01~2026-12-31 평일은 개장하고 마감은 16:00이다. 단 2026-11-26은 휴장, 2026-11-27은 마감 13:00이다. 주말은 휴장이다. 2027년은 없다.
@@ -161,6 +170,10 @@ import-data는 달력·일봉·환율 CSV 스냅샷을 원자적으로 가져오
 ### REQ-BT-003
 
 backtest 명령은 조정 구간과 평가 구간을 분리한 규칙별 지표, 시작 월을 바꾼 롤링 창 결과, 채택 판정, 선택 규칙(채택 규칙이 없으면 baseline), 데이터 파일 해시를 JSON으로 출력한다. 잘못된 rules 파일이면 종료 코드 2로 끝난다.
+
+### REQ-BT-004
+
+백테스트 전용 ma_band 실험 규칙: 분할 조정 N일 이동평균보다 일정 비율 이상 오르면 보유 주식 일부를 T+1 종가로 판 것으로 시뮬레이션하고, 이동평균 기준 이하로 내려오면 그 현금을 다시 매수한다. 매도 수수료, 연간 공제 후 양도소득세를 반영하고 매도 횟수, 실현 손익, 세금을 지표에 추가한다. 운영(run)에서는 이 규칙을 쓸 수 없고 증권사 매도 기능도 만들지 않는다.
 
 ### REQ-ORDER-001
 
@@ -343,6 +356,42 @@ status는 누적 주수, 평균 단가, 최근 주문, 중단 사유를 JSON으�
 - Given: SCN-BT-010의 DB·설정과, type이 "rsi"인 규칙이 들어 있는 rules 파일
 - When: main(["--config", 설정, "backtest", "--rules", rules])
 - Then: 반환값 2, stdout 비어 있음
+
+### SCN-BT-014 → REQ-BT-004
+
+- Given: make_bars 종가 100,100,100,120,120,90,90, 첫 거래일만 입금 100, 수수료·세금 0, 여유 0, fractional true, Rule band(ma_band, ma_days 3, sell_above 10, sell_fraction 100, rebuy_at_or_below 0)
+- When: simulate(bars, [band], settings)
+- Then: band 판단은 1일 매수 1주@100, 4일 매도 1주@120, 6일 매수 1.333333주@90. band 최종 1.333333주, sell_count 1, realized_gain_usd 20, tax_usd 0. 기준선 1주, 차이 +0.333333
+
+### SCN-BT-015 → REQ-BT-004
+
+- Given: SCN-BT-014와 같은 데이터에 capital_gains_tax_pct 22. (a) 공제 0 (b) annual_exemption_usd 25 (c) 종가 100,100,100,120,120,90,90,90,90,110,110,90, sell_fraction 50, 공제 15를 2025-12-01 시작(두 매도가 같은 해)과 2025-12-19 시작(해가 바뀜)으로 실행
+- When: simulate(...)
+- Then: (a) tax_usd 4.40, 재매수 1.284444주, cash_usd 0. (b) tax_usd 0, 1.333333주. (c) 같은 해: 매도 2회, 실현 19.17, 세금 0.92. 해가 바뀜: 매도 2회, 세금 0
+
+### SCN-BT-016 → REQ-BT-004
+
+- Given: 종가 100,100,100,120,120,130,140,150, SCN-BT-014의 band 규칙
+- When: simulate(...)
+- Then: band 최종 0주, cash_usd 120, 환산 0.8주, 기준선 대비 주수 -1, 환산 주수 -0.2
+
+### SCN-BT-017 → REQ-BT-004
+
+- Given: 종가 100,100,100,120,120,60,60,60, 6번째 봉 2:1 분할, rebuy_at_or_below -5
+- When: simulate(...)
+- Then: 매도 뒤 매수 판단 없음(분할로 가격이 반이 되어도 재매수 신호가 아님), band cash_usd 120, 기준선 2주
+
+### SCN-BT-018 → REQ-BT-004
+
+- Given: SCN-BT-010의 DB와 rules 파일에 ma_band 규칙(ma_days 20, sell_above 15, fraction 50, rebuy 0). (a) sell_sim 설정 있음 (b) sell_sim 없음 (c) fraction 0, ma_days 1, rebuy ≥ sell_above, sell_above ≤0 중 하나
+- When: main(["--config", 설정, "backtest", "--rules", rules])
+- Then: (a) 반환값 0, band 지표에 sell_count, realized_gain_usd, tax_usd 키. (b)(c) 반환값 2, stdout 비어 있음
+
+### SCN-BT-019 → REQ-BT-004
+
+- Given: 공통 운영 픽스처 F에서 operating_rule.type = "ma_band"
+- When: run_once(now=2026-11-05 15:30 ET)
+- Then: 반환값 2, reasons ["CONFIG_ERROR"], place 호출 0, 주문 행 0
 
 ### SCN-ORD-001 → REQ-ORDER-001
 
