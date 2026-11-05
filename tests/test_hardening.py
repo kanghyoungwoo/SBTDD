@@ -368,6 +368,20 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn('secret', json.dumps(result))
         self.assertFalse(any('exec' in call.args[0] or '--print' in call.args[0] for call in run.call_args_list))
 
+    def test_claude_workflow_requires_writer_capable_claude(self):
+        from harness.doctor import run_doctor
+        self.manifest['agent'] = {'workflow': 'claude', 'code_paths': ['logic.py'], 'test_paths': ['test_logic.py']}
+        self.save()
+        for version, passed in [('2.1.200 (Claude Code)', False), ('2.1.318 (Claude Code)', True)]:
+            def execute(command, **kwargs):
+                output = version if command[-1] == '--version' else json.dumps({'loggedIn': True})
+                return subprocess.CompletedProcess(command, 0, output, '')
+            with self.subTest(version=version), patch('harness.doctor.shutil.which', side_effect=lambda value: value), \
+                    patch('harness.doctor.subprocess.run', side_effect=execute):
+                result = run_doctor(self.root, 'claude')
+            writer = next(check for check in result['checks'] if check['id'] == 'claude.writer')
+            self.assertEqual((writer['status'] == 'passed', result['status'] == 'ready'), (passed, passed))
+
     def test_missing_cli_is_actionable_and_does_not_require_manifest(self):
         from harness.doctor import run_doctor
         (self.root / 'harness.json').unlink()
@@ -410,6 +424,32 @@ class ProviderPreflightTests(unittest.TestCase):
         self.assertEqual(result['phases'], [])
         verifier.assert_not_called()
         claude.assert_not_called()
+
+    def test_claude_implementer_needs_restricted_mode_support(self):
+        from harness.agent import require_providers
+        for output, outdated in [('2.1.247 (Claude Code)', True), ('2.1.248 (Claude Code)', False),
+                                 ('unrecognized output', False)]:
+            with self.subTest(output=output), patch('harness.agent.shutil.which', return_value='claude'), \
+                    patch('harness.agent.subprocess.run',
+                          return_value=subprocess.CompletedProcess(['claude'], 0, output, '')):
+                if outdated:
+                    with self.assertRaises(AgentError) as error:
+                        require_providers(['claude'], claude_writer=True)
+                    self.assertEqual((error.exception.reason, error.exception.details['minimum']),
+                                     ('agent_outdated', '2.1.248'))
+                else:
+                    require_providers(['claude'], claude_writer=True)
+
+    def test_outdated_claude_stops_claude_workflow_before_checks(self):
+        self.manifest['agent']['workflow'] = 'claude'
+        self.save()
+        with patch('harness.agent.shutil.which', return_value='claude'), \
+                patch('harness.agent.subprocess.run',
+                      return_value=subprocess.CompletedProcess(['claude'], 0, '2.1.100 (Claude Code)', '')), \
+                patch('harness.agent.verification_cli') as verifier:
+            result = run_agent(self.root, self.manifest)
+        self.assertEqual((result['status'], result['reason'], result['version']), ('error', 'agent_outdated', '2.1.100'))
+        verifier.assert_not_called()
 
     def test_init_checks_both_providers_before_paying_for_a_spec(self):
         from harness.spec import run_init

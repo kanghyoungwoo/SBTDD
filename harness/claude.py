@@ -111,10 +111,62 @@ def validate_review(value):
     return value
 
 
-def invoke_claude(root, context, directory, timeout):
+READ_TOOLS = "Read,Glob,Grep"
+WRITE_TOOLS = "Read,Glob,Grep,Edit,Write"
+
+WRITER_INSTRUCTIONS = """You are the implementer in this harness and work through Claude Code file tools only.
+You can read, create and edit files inside the allowed paths; you cannot run commands, tests,
+package managers or network requests. The harness runs the checks after your turn and returns
+any failures and review findings in the next attempt's context, so reason from the supplied logs.
+"""
+
+
+def reader_command(executable, schema, tools, model=None):
+    return [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
+            "--safe-mode", "--tools", tools, "--allowedTools", tools,
+            "--disallowedTools", "mcp__*", "--permission-mode", "dontAsk", "--no-session-persistence",
+            *(["--model", model] if model else [])]
+
+
+def edit_rules(root, paths):
+    """Edit rules (they also govern Write) anchored at the project root, which is the call's cwd."""
+    rules = []
+    for value in paths:
+        relative = Path(value).as_posix().strip("/")
+        rules.append(f"Edit(./{relative}/**)" if (root / value).is_dir() else f"Edit(./{relative})")
+    return rules
+
+
+def writer_command(executable, schema, rules, model=None):
+    # --restricted drops every command-running tool and WebFetch, confines file tools to the working
+    # directory and refuses bypassPermissions; dontAsk denies any edit the rules do not allow.
+    return [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
+            "--restricted", "--safe-mode", "--strict-mcp-config", "--tools", WRITE_TOOLS,
+            "--allowedTools", "Read", "Glob", "Grep", *rules,
+            "--disallowedTools", "mcp__*", "--permission-mode", "dontAsk", "--no-session-persistence",
+            *(["--model", model] if model else [])]
+
+
+def result_parser(validate):
+    def parse(text):
+        envelope = json.loads(text)
+        if not isinstance(envelope, dict) or envelope.get("type") != "result":
+            raise AgentError("invalid_response", "Claude did not return a result envelope.")
+        if envelope.get("is_error") is not False or envelope.get("subtype") != "success":
+            raise AgentError("agent_exit", "Claude failed: " + str(envelope.get("result", envelope.get("subtype"))))
+        return validate(envelope.get("structured_output"))
+    return parse
+
+
+def claude_executable():
     executable = shutil.which("claude")
     if executable is None:
         raise AgentError("agent_missing", "Claude CLI is not on PATH. Install it and run 'claude auth login'.")
+    return executable
+
+
+def invoke_claude(root, context, directory, timeout, model=None):
+    executable = claude_executable()
     if context["phase"] == "spec":
         from .spec import SPEC_INSTRUCTIONS, SPEC_SCHEMA, validate_spec
         schema, validate, instructions = SPEC_SCHEMA, validate_spec, SPEC_INSTRUCTIONS
@@ -125,24 +177,34 @@ def invoke_claude(root, context, directory, timeout):
     prompt = instructions + "\nContext:\n" + json.dumps(context, ensure_ascii=False, indent=2)
     (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
     write_json(directory / "schema.json", schema)
-    command = [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
-               "--safe-mode", "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep",
-               "--disallowedTools", "mcp__*", "--permission-mode", "dontAsk", "--no-session-persistence"]
-    output = run_process(root, command, prompt, directory, timeout, "Claude")
-    def parse(text):
-        envelope = json.loads(text)
-        if not isinstance(envelope, dict) or envelope.get("type") != "result":
-            raise AgentError("invalid_response", "Claude did not return a result envelope.")
-        if envelope.get("is_error") is not False or envelope.get("subtype") != "success":
-            raise AgentError("agent_exit", "Claude failed: " + str(envelope.get("result", envelope.get("subtype"))))
-        return validate(envelope.get("structured_output"))
+    output = run_process(root, reader_command(executable, schema, READ_TOOLS, model), prompt, directory, timeout, "Claude")
 
     def repair(prompt, folder):
-        no_tools = list(command)
-        no_tools[no_tools.index("--tools") + 1] = ""
-        no_tools[no_tools.index("--allowedTools") + 1] = ""
-        return run_process(root, no_tools, prompt, folder, timeout, "Claude response repair")
+        return run_process(root, reader_command(executable, schema, "", model), prompt, folder, timeout,
+                           "Claude response repair")
 
-    response = parse_with_repair(root, output, parse, repair, directory, schema)
+    response = parse_with_repair(root, output, result_parser(validate), repair, directory, schema)
+    write_json(directory / "response.json", response)
+    return response
+
+
+def invoke_claude_writer(root, context, directory, timeout, model=None):
+    """Claude in the Codex roles: write tests, scaffold or implementation within the phase's paths."""
+    from .agent import INSTRUCTIONS as TASK_INSTRUCTIONS, RESPONSE_SCHEMA, SCAFFOLD_INSTRUCTIONS, validate_response
+    executable = claude_executable()
+    phase = context["phase"]
+    paths = ["src", "tests"] if phase == "scaffold" else context["test_paths" if phase == "tests" else "code_paths"]
+    instructions = WRITER_INSTRUCTIONS + (SCAFFOLD_INSTRUCTIONS if phase == "scaffold" else TASK_INSTRUCTIONS)
+    prompt = instructions + "\nContext:\n" + json.dumps(context, ensure_ascii=False, indent=2)
+    (directory / "prompt.txt").write_text(prompt, encoding="utf-8")
+    write_json(directory / "schema.json", RESPONSE_SCHEMA)
+    command = writer_command(executable, RESPONSE_SCHEMA, edit_rules(root, paths), model)
+    output = run_process(root, command, prompt, directory, timeout, "Claude")
+
+    def repair(prompt, folder):
+        return run_process(root, reader_command(executable, RESPONSE_SCHEMA, "", model), prompt, folder, timeout,
+                           "Claude response repair")
+
+    response = parse_with_repair(root, output, result_parser(validate_response), repair, directory, RESPONSE_SCHEMA)
     write_json(directory / "response.json", response)
     return response

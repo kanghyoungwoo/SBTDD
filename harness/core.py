@@ -91,8 +91,8 @@ def load_manifest(root):
     if "agent" in data:
         settings = data["agent"]
         fields(settings, {"code_paths", "test_paths"}, {"workflow"}, "agent")
-        require(settings.get("workflow", "codex") in ("codex", "claude-codex"),
-                "agent.workflow must be codex or claude-codex")
+        require(settings.get("workflow", "codex") in ("codex", "claude-codex", "claude"),
+                "agent.workflow must be codex, claude-codex or claude")
         inputs = [root / value for value in data["inputs"]]
         scopes = {}
         for name in ("code_paths", "test_paths"):

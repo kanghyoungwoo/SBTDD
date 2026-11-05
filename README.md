@@ -37,7 +37,8 @@ Harness는 세 가지 개발 방식을 연결해 이 확인 과정을 명시적�
 | --- | --- |
 | `check`, `run`, `status` | Python 3.11 이상, 프로젝트 검사 명령에 필요한 도구 |
 | `agent`의 `codex` 흐름 | 위 환경 + 설치·로그인된 Codex CLI |
-| `init`, `agent`의 `claude-codex` 흐름 | 위 환경 + 설치·로그인된 Claude CLI |
+| `init`, `agent`의 `claude-codex` 흐름 | 첫 행의 환경 + 설치·로그인된 Claude CLI와 Codex CLI |
+| `init --implementer claude`, `agent`의 `claude` 흐름 | 첫 행의 환경 + 설치·로그인된 Claude CLI 2.1.248 이상 (Codex 불필요) |
 
 Harness의 Python 런타임 의존성은 표준 라이브러리뿐입니다. AI 실행기는 설치된 CLI의 로그인과 모델 설정을 사용합니다. 실제 모델 호출은 해당 계정의 사용량을 소모합니다.
 
@@ -101,7 +102,7 @@ python -B -m harness --root ../NewProject init --brief examples/new_project_brie
 
 1. Claude가 요구사항·설계·Given/When/Then을 구조화합니다.
 2. Harness가 `BRIEF.md`, `SPEC.md`, `harness.json`과 시나리오별 검사 명령을 만듭니다.
-3. Codex가 `src/`에 미구현 API 뼈대, `tests/`에 실제 기대 결과를 단정하는 unittest 테스트를 작성합니다.
+3. Codex(또는 `--implementer claude`이면 Claude)가 `src/`에 미구현 API 뼈대, `tests/`에 실제 기대 결과를 단정하는 unittest 테스트를 작성합니다.
 4. 공통 CLI가 초안을 검사하고, 모든 시나리오의 테스트가 `src/`의 `NotImplementedError` 때문에 실패하는지 확인합니다.
 5. 조건을 충족한 파일을 대상에 배치하고 `ready`를 반환합니다.
 
@@ -185,7 +186,15 @@ AI를 사용하려면 `code_paths`와 `test_paths`를 지정합니다. 두 범�
 python -B -m harness --root examples/inventory agent --requirement REQ-STOCK --max-attempts 3 --timeout-seconds 300
 ```
 
-`workflow`는 `claude-codex` 또는 `codex`입니다. 생략하면 Codex 단독 흐름을 사용합니다.
+`workflow`는 다음 셋 중 하나입니다. 생략하면 Codex 단독 흐름을 사용합니다.
+
+| `workflow` | 설계·검토 | 테스트·구현 |
+| --- | --- | --- |
+| `codex` | 없음 | Codex |
+| `claude-codex` | Claude | Codex |
+| `claude` | Claude | Claude |
+
+`init --implementer claude`로 만든 프로젝트는 처음부터 `claude` 흐름을 씁니다.
 
 ## AI 역할과 완료 조건
 
@@ -202,19 +211,31 @@ flowchart TD
     G -->|승인| H[완료]
 ```
 
-위 그림은 실패한 요구사항을 처리하는 `claude-codex` 흐름입니다. 구현·검토 재작업은 `--max-attempts` 한도 안에서 수행합니다. `--timeout-seconds`는 AI 호출별 제한이며 기본값은 300초입니다.
+위 그림은 실패한 요구사항을 처리하는 `claude-codex` 흐름입니다. `claude` 흐름은 Codex 단계를 Claude가 맡고 나머지는 같습니다. 구현·검토 재작업은 `--max-attempts` 한도 안에서 수행합니다. `--timeout-seconds`는 AI 호출별 제한이며 기본값은 300초입니다.
 
 | 역할 | 수행 작업 | 수정 범위 |
 | --- | --- | --- |
 | Claude 설계 | 기존 명세와 코드에서 구현 계획·테스트 전략 작성 | 읽기 전용 |
-| Codex 테스트 | 기존 실패 테스트를 검토하거나 새 테스트 파일 추가 | `test_paths`에 새 파일만 추가 |
-| Codex 구현 | 선택한 요구사항 구현 및 발생한 회귀 수정 | `code_paths` |
+| 구현자 테스트 (Codex 또는 Claude) | 기존 실패 테스트를 검토하거나 새 테스트 파일 추가 | `test_paths`에 새 파일만 추가 |
+| 구현자 구현 (Codex 또는 Claude) | 선택한 요구사항 구현 및 발생한 회귀 수정 | `code_paths` |
 | 검증 CLI | 실제 검사 실행 및 상태 계산 | 실행 증거 저장 |
 | Claude 검토 | 명세·코드·테스트·diff·검사 증거 검토 | 읽기 전용 |
 
 이미 충분한 실패 테스트가 있으면 새 테스트 추가를 강제하지 않습니다. 설계와 검토는 별도 세션에서 실행합니다. 명세나 기존 테스트를 수정해야 하면 `needs_input`으로 중단합니다.
 
 자동 선택은 계약 순서의 첫 미통과 요구사항입니다. 이미 모든 검사가 통과한 프로젝트를 Claude로 검토하려면 `--requirement ID`를 지정합니다. 이 경우 설계·검토를 거쳐 승인되면 코드 수정 없이 완료할 수 있습니다.
+
+### Claude가 구현을 맡을 때
+
+Claude 구현자는 `--restricted` 모드에서 Read·Glob·Grep·Edit·Write 도구만 받습니다. Bash 같은 명령 실행 도구와 WebFetch가 없고, 편집은 그 단계의 경로(`Edit(./src/**)` 같은 규칙)로 제한됩니다. 그래서 OS sandbox가 없는 native Windows에서도 명령이 실행되지 않습니다. 대신 Claude는 테스트를 직접 돌리지 못하고, Harness가 실행한 결과를 다음 시도에서 받습니다. 도구 제한은 1차 방어이고, Codex와 같은 변경 감지·증거 보호가 최종 판정입니다.
+
+같은 모델 계열이 구현과 검토를 모두 맡으면 같은 오해를 공유하기 쉽습니다. 검토 모델을 다르게 지정하는 것을 권합니다.
+
+```powershell
+python -B -m harness --root PROJECT agent --requirement ID --review-model opus --implement-model sonnet
+```
+
+`--review-model`은 Claude의 명세·설계·검토, `--implement-model`은 Claude의 테스트·구현에 쓰입니다. 모델 옵션은 계약이 아니라서 `harness.json`이 아닌 실행 기록(`run.json`의 `models`)에 남고, 바꿔도 기존 검사 결과가 stale이 되지 않습니다.
 
 Codex 단독 흐름은 Claude 단계를 생략하며, 이미 통과한 대상은 AI 호출 없이 종료합니다. 구현 후 완료 판정은 이번 실행에서 새로 얻은 검사 결과를 사용합니다. 선택한 요구사항의 통과와 기존 통과 검사의 회귀 해소가 필요하며, Claude 흐름에는 검토 승인도 필요합니다.
 
@@ -230,6 +251,7 @@ Codex 단독 흐름은 Claude 단계를 생략하며, 이미 통과한 대상은
 | `python -m harness --root PROJECT run --requirement ID` | 요구사항 하나에 연결된 검사 실행 |
 | `python -m harness --root PROJECT status` | 현재 입력과 저장된 검사 결과 비교 |
 | `python -m harness --root PROJECT init --brief FILE` | 빈 프로젝트의 명세·테스트 뼈대 생성 |
+| `python -m harness --root PROJECT init --brief FILE --implementer claude` | Claude만으로 뼈대 생성, `claude` 흐름 계약 생성 |
 | `python -m harness --root PROJECT agent --requirement ID` | 요구사항 하나의 구현·검증·검토 |
 
 ## 결과 읽기
@@ -305,6 +327,7 @@ AI 호출 자료에는 프롬프트, 응답 스키마, 응답 JSON, 표준 출�
 | `verification_setup` | 검사 도구·의존성·실행 오류·시간 초과 해결 |
 | `invalid_response` | 원본 응답과 `repair/` 확인 |
 | `agent_missing`, `agent_launch` | CLI 설치·실행 권한·로그인 확인(`agent_missing`은 `missing`에 목록이 있음). `doctor`로 다시 점검 |
+| `agent_outdated` | Claude 구현에 필요한 Claude Code 2.1.248 이상으로 업데이트 (`version`, `minimum` 확인) |
 | `agent_exit`, `agent_timeout`, `verification_error` | 호출 로그·검증 기록과 필요 시 `doctor` 확인 |
 | `project_locked` | `lock_owner`의 명령이 끝날 때까지 기다림. 잠금 파일은 지우지 않음 |
 | `requirement_required` | 검토할 요구사항을 `--requirement`로 지정 |
@@ -340,6 +363,10 @@ python -B examples/run_init_demo.py
 
 # 재고 예제에 버그 주입 → 설계 → 수정 → 검증 → 검토
 python -B examples/run_agent_demo.py
+
+# 같은 데모를 Claude만으로 실행 (Codex 불필요)
+python -B examples/run_init_demo.py --implementer claude
+python -B examples/run_agent_demo.py --implementer claude
 ```
 
 결과 프로젝트는 `.harness/demos/` 아래에 생성됩니다. 두 데모 모두 실제 AI 사용량을 소모합니다.

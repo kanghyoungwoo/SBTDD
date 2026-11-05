@@ -22,6 +22,8 @@ def main():
     initializer = commands.add_parser("init", help="create a new Python project contract and TDD scaffold from a brief")
     initializer.add_argument("--brief", type=Path, required=True, help="UTF-8 requirements file, relative to the current directory")
     initializer.add_argument("--timeout-seconds", type=int, default=300, help="timeout for each AI invocation")
+    initializer.add_argument("--implementer", choices=("codex", "claude"), default="codex",
+                             help="who writes the scaffold; claude also makes the generated workflow 'claude'")
     doctor = commands.add_parser("doctor", help="check local CLIs, login and project setup without model calls")
     doctor.add_argument("--provider", choices=("all", "codex", "claude"), default="all")
     commands.add_parser("check", help="validate the project contract without running tests")
@@ -32,13 +34,17 @@ def main():
     agent.add_argument("--requirement", help="target requirement; defaults to the first failing requirement")
     agent.add_argument("--max-attempts", type=int, default=3, help="maximum implementation attempts")
     agent.add_argument("--timeout-seconds", type=int, default=300, help="timeout for each AI invocation")
+    for command in (initializer, agent):
+        command.add_argument("--review-model", help="Claude model for specification, design and review")
+        command.add_argument("--implement-model", help="Claude model when Claude writes tests and code")
     try:
         args = parser.parse_args()
         root = args.root.resolve()
         if args.command == "doctor":
             result = run_doctor(root, args.provider)
         elif args.command == "init":
-            result = run_init(root, args.brief, args.timeout_seconds)
+            result = run_init(root, args.brief, args.timeout_seconds, implementer=args.implementer,
+                              review_model=args.review_model, implement_model=args.implement_model)
         else:
             manifest = load_manifest(root)
             current = fingerprint(root, manifest)
@@ -49,7 +55,8 @@ def main():
         elif args.command == "run":
             result = run_checks(root, manifest, current, args.requirement)
         elif args.command == "agent":
-            result = run_agent(root, manifest, args.requirement, args.max_attempts, args.timeout_seconds)
+            result = run_agent(root, manifest, args.requirement, args.max_attempts, args.timeout_seconds,
+                               review_model=args.review_model, implement_model=args.implement_model)
         elif args.command == "status":
             result = project_status(root, manifest, current)
         exit_code = 0 if result["status"] in ("valid", "passed", "ready") else 2 if result["status"] == "error" else 1

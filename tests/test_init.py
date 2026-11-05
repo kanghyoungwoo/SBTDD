@@ -293,12 +293,43 @@ class InitTests(unittest.TestCase):
 
     def test_ready_is_successful_in_public_cli(self):
         from harness.__main__ import main
-        with patch("sys.argv", ["harness", "--root", str(self.root), "init", "--brief", str(self.brief)]), \
-                patch("harness.__main__.run_init", return_value={"status": "ready"}) as initialize, \
-                patch("harness.__main__.load_manifest", side_effect=AssertionError("Must not load an existing contract")), \
-                patch("builtins.print"):
-            self.assertEqual(main(), 0)
-        initialize.assert_called_once_with(self.root, self.brief, 300)
+        for extra, options in [([], {"implementer": "codex", "review_model": None, "implement_model": None}),
+                               (["--implementer", "claude", "--review-model", "opus", "--implement-model", "sonnet"],
+                                {"implementer": "claude", "review_model": "opus", "implement_model": "sonnet"})]:
+            with self.subTest(extra=extra), \
+                    patch("sys.argv", ["harness", "--root", str(self.root), "init", "--brief", str(self.brief), *extra]), \
+                    patch("harness.__main__.run_init", return_value={"status": "ready"}) as initialize, \
+                    patch("harness.__main__.load_manifest", side_effect=AssertionError("Must not load an existing contract")), \
+                    patch("builtins.print"):
+                self.assertEqual(main(), 0)
+            initialize.assert_called_once_with(self.root, self.brief, 300, **options)
+
+    def test_claude_implementer_scaffolds_and_generates_claude_workflow(self):
+        def writer(root, context, directory, timeout, model=None):
+            self.assertEqual(model, "sonnet")
+            return scaffold(root, context, directory, timeout)
+        def designer(root, context, directory, timeout, model=None):
+            self.assertEqual(model, "opus")
+            return specification()
+        with patch("harness.spec.invoke_claude", side_effect=designer), \
+                patch("harness.spec.invoke_claude_writer", side_effect=writer), \
+                patch("harness.spec.invoke_codex") as codex, \
+                patch("harness.spec.require_providers") as providers:
+            result = run_init(self.root, self.brief, implementer="claude", review_model="opus", implement_model="sonnet")
+        self.assertEqual(result["status"], "ready")
+        codex.assert_not_called()
+        providers.assert_called_once_with(["claude"], claude_writer=True)
+        self.assertEqual([(p["phase"], p.get("provider")) for p in result["phases"]],
+                         [("spec", "claude"), ("scaffold", "claude"), ("red", None)])
+        self.assertEqual(load_manifest(self.root)["agent"]["workflow"], "claude")
+        self.assertEqual(result["models"], {"review": "opus", "implement": "sonnet"})
+        self.assertEqual(result["next_command"][-4:], ["--review-model", "opus", "--implement-model", "sonnet"])
+
+    def test_implement_model_needs_claude_implementer(self):
+        with patch("harness.spec.invoke_claude") as claude, self.assertRaisesRegex(ValueError, "implement-model"):
+            run_init(self.root, self.brief, implement_model="sonnet")
+        claude.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
 
 
 if __name__ == "__main__":

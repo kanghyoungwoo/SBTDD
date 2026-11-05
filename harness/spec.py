@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 import re
 import sys
@@ -9,7 +10,7 @@ from .agent import (AgentError, guarded_invoke, ignored_details, invoke_codex, r
 from .guard import check_integrity, plain_path
 from .lock import project_lock
 from .processes import interrupt_on_term
-from .claude import invoke_claude
+from .claude import invoke_claude, invoke_claude_writer
 from .core import HarnessError, fields, fingerprint, input_files, is_text, load_manifest, require
 
 
@@ -86,10 +87,10 @@ def validate_spec(value):
     return value
 
 
-def make_manifest(spec):
+def make_manifest(spec, workflow="claude-codex"):
     return {
         "version": 1, "inputs": ["BRIEF.md", "SPEC.md", "src", "tests"],
-        "agent": {"workflow": "claude-codex", "code_paths": ["src"], "test_paths": ["tests"]},
+        "agent": {"workflow": workflow, "code_paths": ["src"], "test_paths": ["tests"]},
         "requirements": spec["requirements"], "scenarios": spec["scenarios"],
         "checks": [{"id": f"CHK-{i:03}", "kind": "acceptance", "scenarios": [scenario["id"]],
                     "command": ["{python}", "-B", "-m", "unittest", "discover", "-s", "tests",
@@ -142,8 +143,12 @@ def stub_red_problem(root, result):
 
 
 @interrupt_on_term
-def run_init(root, brief_path, timeout_seconds=300):
+def run_init(root, brief_path, timeout_seconds=300, implementer="codex", review_model=None, implement_model=None):
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
+    require(implementer in ("codex", "claude"), "implementer must be codex or claude")
+    require(review_model is None or is_text(review_model), "--review-model must be a model name")
+    require(implement_model is None or implementer == "claude" and is_text(implement_model),
+            "--implement-model needs --implementer claude; Codex uses its own configured model")
     brief_path = brief_path.resolve()
     brief_bytes = brief_path.read_bytes()
     try:
@@ -160,7 +165,7 @@ def run_init(root, brief_path, timeout_seconds=300):
     # Refuse a non-empty target before the lock creates .harness inside it.
     require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
     with project_lock(root, "init"):
-        return initialize(root, brief_path, brief_bytes, brief, timeout_seconds)
+        return initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implementer, review_model, implement_model)
 
 
 def empty_project(root, brief_path):
@@ -169,7 +174,8 @@ def empty_project(root, brief_path):
                for path in root.iterdir())
 
 
-def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
+def initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implementer="codex",
+               review_model=None, implement_model=None):
     check_integrity(root)
     require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
     started = datetime.now(timezone.utc)
@@ -182,7 +188,14 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
     report = {"schema_version": 1, "command": "init", "session_id": session_id,
               "project_root": str(root), "record": (directory / "run.json").relative_to(root).as_posix(),
               "draft": draft.relative_to(root).as_posix(), "brief_source": str(brief_path),
-              "started_at": started.isoformat(), "status": "running", "phases": []}
+              "started_at": started.isoformat(), "status": "running", "implementer": implementer,
+              "models": {"review": review_model, "implement": implement_model}, "phases": []}
+    designer = partial(invoke_claude, model=review_model) if review_model else invoke_claude
+    builder = invoke_claude_writer if implementer == "claude" else invoke_codex
+    if implement_model:
+        builder = partial(builder, model=implement_model)
+    model_options = [*(["--review-model", review_model] if review_model else []),
+                     *(["--implement-model", implement_model] if implement_model else [])]
 
     def save():
         write_json(directory / "run.json", report)
@@ -213,8 +226,9 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
 
     save()
     try:
-        require_providers(["claude", "codex"])
-        spec = call("spec", "claude", {"phase": "spec", "brief": brief}, invoke_claude, validate_spec)
+        require_providers(["claude"] if implementer == "claude" else ["claude", "codex"],
+                          claude_writer=implementer == "claude")
+        spec = call("spec", "claude", {"phase": "spec", "brief": brief}, designer, validate_spec)
         if list(draft.iterdir()) != [draft / "BRIEF.md"] or (draft / "BRIEF.md").read_bytes() != brief_bytes:
             return finish("needs_input", "scope_changed", message="Claude must not modify the draft project.")
         if spec["outcome"] == "needs_input":
@@ -222,13 +236,13 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
         (draft / "src").mkdir()
         (draft / "tests").mkdir()
         (draft / "SPEC.md").write_text(render_spec(spec), encoding="utf-8")
-        write_json(draft / "harness.json", make_manifest(spec))
+        write_json(draft / "harness.json", make_manifest(spec, "claude" if implementer == "claude" else "claude-codex"))
         manifest = load_manifest(draft)
         verification_cli(draft, manifest, "check")
         context = {"phase": "scaffold", "contract": manifest, "design": spec["design"],
                    "test_files": [{"scenario": check["scenarios"][0], "check": check["id"],
                                    "path": "tests/" + check["command"][-1]} for check in manifest["checks"]]}
-        response = call("scaffold", "codex", context, invoke_codex, validate_response)
+        response = call("scaffold", implementer, context, builder, validate_response)
         if response["outcome"] == "needs_input":
             return finish("needs_input", "agent_question", question=response["question"], message=response["summary"])
         red = verification_cli(draft, manifest, "run")
@@ -274,7 +288,7 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds):
         return finish("ready", "scaffold_verified", artifacts=artifacts, fingerprint=current,
                       red_check_ids=sorted(check_ids), requirements=[r["id"] for r in manifest["requirements"]],
                       next_command=[sys.executable, "-B", "-m", "harness", "--root", str(root), "agent",
-                                    "--requirement", manifest["requirements"][0]["id"]])
+                                    "--requirement", manifest["requirements"][0]["id"], *model_options])
     except AgentError as error:
         return finish(error.status, error.reason, message=str(error), **error.details)
     except (ValueError, OSError) as error:

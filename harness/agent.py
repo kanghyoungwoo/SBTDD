@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 import difflib
+from functools import partial
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -73,6 +75,8 @@ Use needs_input with a precise question if the contract or project environment i
 
 
 PROVIDER_LOGIN = {"codex": "codex login", "claude": "claude auth login"}
+# Claude writes code only with --restricted, which Claude Code added in 2.1.248.
+CLAUDE_WRITER_MINIMUM = (2, 1, 248)
 
 
 class AgentError(HarnessError):
@@ -83,13 +87,37 @@ class AgentError(HarnessError):
         self.details = details
 
 
-def require_providers(names):
+def parse_version(text):
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def cli_version(executable):
+    """(major, minor, patch) from '<cli> --version', or None when it cannot be read."""
+    try:
+        output = subprocess.run([executable, "--version"], capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=15, env=environment(),
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_version(output)
+
+
+def require_providers(names, claude_writer=False):
     """Stop before baseline checks or paid model calls when a CLI the workflow needs is missing."""
     missing = [name for name in names if shutil.which(name) is None]
     if missing:
         logins = " and ".join(f"'{PROVIDER_LOGIN[name]}'" for name in missing)
         raise AgentError("agent_missing", f"AI CLI not on PATH: {', '.join(missing)}. Install it and run {logins}; "
                          "'harness doctor' checks the local setup.", missing=missing)
+    if claude_writer:
+        # An unreadable version is not a refusal; an unsupported flag then fails the first call visibly.
+        version = cli_version(shutil.which("claude"))
+        if version is not None and version < CLAUDE_WRITER_MINIMUM:
+            needed, found = (".".join(map(str, value)) for value in (CLAUDE_WRITER_MINIMUM, version))
+            raise AgentError("agent_outdated", f"The claude implementer needs Claude Code {needed} or newer "
+                             f"(found {found}). Update Claude Code, then run 'harness doctor'.",
+                             version=found, minimum=needed)
 
 
 def write_json(path, value):
@@ -349,20 +377,27 @@ def write_diff(root, manifest, original, directory):
 
 
 @interrupt_on_term
-def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=300):
+def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=300,
+              review_model=None, implement_model=None):
     require("agent" in manifest, "harness.json needs agent.code_paths and agent.test_paths")
     require(type(max_attempts) is int and max_attempts > 0, "max-attempts must be a positive integer")
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
     require(requirement is None or any(r["id"] == requirement for r in manifest["requirements"]),
             f"Unknown requirement: {requirement}")
-    with project_lock(root, "agent"):
-        return develop(root, manifest, requirement, max_attempts, timeout_seconds)
-
-
-def develop(root, manifest, requirement, max_attempts, timeout_seconds):
     workflow = manifest["agent"].get("workflow", "codex")
-    require(workflow in ("codex", "claude-codex"), "Unknown agent workflow")
-    use_claude = workflow == "claude-codex"
+    require(workflow in ("codex", "claude-codex", "claude"), "Unknown agent workflow")
+    require(review_model is None or workflow != "codex" and is_text(review_model),
+            "--review-model needs a workflow with Claude design and review")
+    require(implement_model is None or workflow == "claude" and is_text(implement_model),
+            "--implement-model needs the claude workflow; Codex uses its own configured model")
+    with project_lock(root, "agent"):
+        return develop(root, manifest, requirement, max_attempts, timeout_seconds, review_model, implement_model)
+
+
+def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_model=None, implement_model=None):
+    workflow = manifest["agent"].get("workflow", "codex")
+    use_claude = workflow != "codex"
+    implementer = "claude" if workflow == "claude" else "codex"
     design, review = None, None
     started = datetime.now(timezone.utc)
     session_id = started.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
@@ -372,7 +407,9 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
     report = {"schema_version": 1, "command": "agent", "session_id": session_id,
               "project_root": str(root), "record": (directory / "run.json").relative_to(root).as_posix(),
               "started_at": started.isoformat(), "status": "running", "requirement": requirement,
-              "workflow": workflow, "review_status": "unverified" if use_claude else "not_requested",
+              "workflow": workflow, "implementer": implementer,
+              "models": {"review": review_model, "implement": implement_model},
+              "review_status": "unverified" if use_claude else "not_requested",
               "attempts": 0, "max_attempts": max_attempts, "project_status": "unverified", "phases": []}
 
     def save():
@@ -404,13 +441,19 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
                                 and (r["id"] in check_ids or r["id"] in regressions)]}
         call_directory = directory / ("tests" if phase == "tests" else f"implement-{attempt}")
         call_directory.mkdir()
-        event = {"phase": phase, "provider": "codex", "attempt": attempt, "status": "running"}
+        if implementer == "claude":
+            from .claude import invoke_claude_writer as invoke
+        else:
+            invoke = invoke_codex
+        if implement_model:
+            invoke = partial(invoke, model=implement_model)
+        event = {"phase": phase, "provider": implementer, "attempt": attempt, "status": "running"}
         report["phases"].append(event)
         if use_claude and phase == "implement":
             report["review_status"] = "unverified"
         save()
         try:
-            raw, changed, ignored = guarded_invoke(root, root, invoke_codex, context, call_directory, timeout_seconds,
+            raw, changed, ignored = guarded_invoke(root, root, invoke, context, call_directory, timeout_seconds,
                                           manifest["agent"]["test_paths" if phase == "tests" else "code_paths"],
                                           add_only=phase == "tests")
             response = validate_response(raw)
@@ -447,7 +490,8 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
         save()
         try:
             validate = validate_design if phase == "design" else validate_review
-            raw, changed, ignored = guarded_invoke(root, root, invoke_claude, context, call_directory, timeout_seconds)
+            invoke = partial(invoke_claude, model=review_model) if review_model else invoke_claude
+            raw, changed, ignored = guarded_invoke(root, root, invoke, context, call_directory, timeout_seconds)
             response = validate(raw)
         except AgentError as error:
             event.update(status="error", reason=error.reason, message=str(error), **error.details)
@@ -477,7 +521,10 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds):
     save()
     try:
         check_integrity(root)
-        require_providers(["claude", "codex"] if use_claude else ["codex"])
+        providers = ["claude"] if use_claude else []
+        if implementer == "codex":
+            providers.append("codex")
+        require_providers(providers, claude_writer=implementer == "claude")
         verification_cli(root, manifest, "check")
         baseline = verify("baseline")
         state = current_state(manifest, baseline)

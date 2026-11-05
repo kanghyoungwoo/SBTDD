@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from tests import test_agent, test_cli
 from harness.agent import AgentError, run_agent
-from harness.claude import invoke_claude, validate_design, validate_review
+from harness.claude import invoke_claude, invoke_claude_writer, validate_design, validate_review
 
 
 def design(outcome="continue", question=""):
@@ -196,6 +196,153 @@ class RoleWorkflowTests(unittest.TestCase):
             self.manifest["agent"]["workflow"] = value
             self.save()
             self.assertIn("workflow", self.cli("check", expected=2)["error"])
+
+
+class ClaudeWorkflowTests(unittest.TestCase):
+    """workflow "claude": Claude designs, writes tests and code, and reviews; Codex is not used."""
+    save = test_cli.HarnessTests.save
+    cli = test_cli.HarnessTests.cli
+
+    def setUp(self):
+        test_agent.AgentTests.setUp(self)
+        self.manifest["agent"]["workflow"] = "claude"
+        self.save()
+
+    def test_claude_designs_writes_and_reviews_without_codex(self):
+        def writer(root, context, directory, timeout, model=None):
+            self.assertEqual(model, "sonnet")
+            if context["phase"] == "implement":
+                (root / "logic.py").write_text("VALUE = 2\n", encoding="utf-8")
+            return test_agent.response()
+        def reviewer(root, context, directory, timeout, model=None):
+            self.assertEqual(model, "opus")
+            return design() if context["phase"] == "design" else review()
+        with patch("harness.agent.invoke_codex") as codex, \
+                patch("harness.claude.invoke_claude_writer", side_effect=writer), \
+                patch("harness.claude.invoke_claude", side_effect=reviewer), \
+                patch("harness.agent.require_providers") as providers:
+            result = run_agent(self.root, self.manifest, review_model="opus", implement_model="sonnet")
+        self.assertEqual(json.loads((self.root / result["record"]).read_text(encoding="utf-8")), result)
+        self.assertEqual((result["status"], result["review_status"]), ("passed", "approved"))
+        codex.assert_not_called()
+        providers.assert_called_once_with(["claude"], claude_writer=True)
+        self.assertEqual([(p["phase"], p["provider"]) for p in result["phases"] if "provider" in p],
+                         [("design", "claude"), ("tests", "claude"), ("implement", "claude"), ("review", "claude")])
+        self.assertEqual((result["implementer"], result["models"]), ("claude", {"review": "opus", "implement": "sonnet"}))
+
+    def test_claude_writer_scope_is_still_checked_by_the_harness(self):
+        def writer(root, context, *args, **kwargs):
+            if context["phase"] == "implement":
+                (root / "test_logic.py").write_text("# weakened\n", encoding="utf-8")
+            return test_agent.response()
+        with patch("harness.claude.invoke_claude_writer", side_effect=writer), \
+                patch("harness.claude.invoke_claude", side_effect=lambda root, context, *args, **kwargs:
+                      design() if context["phase"] == "design" else review()), \
+                patch("harness.agent.require_providers"):
+            result = run_agent(self.root, self.manifest)
+        self.assertEqual(result["reason"], "scope_changed")
+        self.assertIn("test_logic.py", result["changed_files"])
+
+    def test_model_options_must_match_the_workflow(self):
+        for workflow, option, message in [("claude-codex", {"implement_model": "sonnet"}, "implement-model"),
+                                          ("codex", {"review_model": "opus"}, "review-model")]:
+            with self.subTest(workflow=workflow):
+                self.manifest["agent"]["workflow"] = workflow
+                self.save()
+                with self.assertRaisesRegex(ValueError, message):
+                    run_agent(self.root, self.manifest, **option)
+        self.assertFalse((self.root / ".harness").exists())
+
+    def test_agent_cli_passes_model_options(self):
+        from harness.__main__ import main
+        with patch("sys.argv", ["harness", "--root", str(self.root), "agent",
+                                "--review-model", "opus", "--implement-model", "sonnet"]), \
+                patch("harness.__main__.run_agent", return_value={"status": "passed"}) as develop, \
+                patch("builtins.print"):
+            self.assertEqual(main(), 0)
+        self.assertEqual(develop.call_args.kwargs, {"review_model": "opus", "implement_model": "sonnet"})
+
+    def test_claude_workflow_is_a_valid_contract(self):
+        self.assertEqual(self.cli("check")["status"], "valid")
+
+
+class ClaudeWriterAdapterTests(unittest.TestCase):
+    save = test_cli.HarnessTests.save
+
+    def setUp(self):
+        test_cli.HarnessTests.setUp(self)
+        self.directory = self.root / ".harness" / "claude-writer"
+        self.directory.mkdir(parents=True)
+
+    def invoke(self, context, outputs=None, model=None):
+        processes = []
+        for output in outputs or [json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                              "structured_output": test_agent.response()})]:
+            process = Mock(returncode=0)
+            process.communicate.return_value = (output, "")
+            processes.append(process)
+        with patch("harness.claude.shutil.which", return_value="claude.exe"), \
+                patch("harness.agent.subprocess.Popen", side_effect=processes) as launch:
+            result = invoke_claude_writer(self.root, context, self.directory, 30, model=model)
+        return result, [call.args[0] for call in launch.call_args_list], processes
+
+    @staticmethod
+    def allowed(command):
+        return command[command.index("--allowedTools") + 1:command.index("--disallowedTools")]
+
+    def test_implementer_can_only_edit_code_paths_and_cannot_run_commands(self):
+        result, commands, processes = self.invoke({"phase": "implement", "requirement": {"id": "REQ-1"},
+                                                   "code_paths": ["logic.py"], "test_paths": ["test_logic.py"]})
+        command = commands[0]
+        self.assertEqual(result, test_agent.response())
+        self.assertEqual(command[0], "claude.exe")
+        self.assertIn("--restricted", command)
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Glob,Grep,Edit,Write")
+        self.assertEqual(self.allowed(command), ["Read", "Glob", "Grep", "Edit(./logic.py)"])
+        self.assertEqual(command[command.index("--permission-mode") + 1], "dontAsk")
+        for flag in ("--safe-mode", "--strict-mcp-config", "--no-session-persistence"):
+            self.assertIn(flag, command)
+        for forbidden in ("Bash", "PowerShell", "WebFetch", "--dangerously-skip-permissions", "--model"):
+            self.assertFalse(any(forbidden in part for part in command), forbidden)
+        prompt = processes[0].communicate.call_args.kwargs["input"]
+        self.assertIn("you cannot run commands", prompt)
+        self.assertIn("In phase 'implement', change only code_paths", prompt)
+        self.assertTrue((self.directory / "response.json").exists())
+
+    def test_each_phase_gets_only_its_own_paths(self):
+        (self.root / "src").mkdir()
+        (self.root / "tests").mkdir()
+        for context, rules, text in [
+                ({"phase": "tests", "code_paths": ["src"], "test_paths": ["tests"]}, ["Edit(./tests/**)"],
+                 "add new test files inside test_paths only"),
+                ({"phase": "scaffold"}, ["Edit(./src/**)", "Edit(./tests/**)"], "Do not implement business behavior yet")]:
+            with self.subTest(phase=context["phase"]):
+                _, commands, processes = self.invoke(context)
+                self.assertEqual(self.allowed(commands[0])[3:], rules)
+                self.assertIn(text, processes[0].communicate.call_args.kwargs["input"])
+
+    def test_model_is_passed_only_when_requested(self):
+        _, commands, _ = self.invoke({"phase": "implement", "code_paths": ["logic.py"], "test_paths": ["test_logic.py"]},
+                                     model="sonnet")
+        self.assertEqual(commands[0][commands[0].index("--model") + 1], "sonnet")
+
+    def test_format_repair_runs_without_tools_or_edit_rules(self):
+        valid = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                            "structured_output": test_agent.response()})
+        broken = json.dumps({"type": "result", "subtype": "success", "is_error": False, "structured_output": {}})
+        result, commands, _ = self.invoke({"phase": "implement", "code_paths": ["logic.py"], "test_paths": ["test_logic.py"]},
+                                          outputs=[broken, valid])
+        self.assertEqual(result, test_agent.response())
+        repair = commands[1]
+        self.assertEqual(repair[repair.index("--tools") + 1], "")
+        self.assertFalse(any(part.startswith("Edit(") for part in repair))
+
+    def test_failed_result_is_an_agent_error(self):
+        failure = json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True, "result": "limit"})
+        with self.assertRaises(AgentError) as error:
+            self.invoke({"phase": "implement", "code_paths": ["logic.py"], "test_paths": ["test_logic.py"]},
+                        outputs=[failure])
+        self.assertEqual(error.exception.reason, "agent_exit")
 
 
 class ClaudeAdapterTests(unittest.TestCase):

@@ -1,5 +1,9 @@
-"""Generate a new project from a brief, then implement and review its requirements."""
+"""Generate a new project from a brief, then implement and review its requirements.
 
+By default Codex writes the scaffold and code; --implementer claude uses Claude for every role.
+"""
+
+import argparse
 import json
 from pathlib import Path
 import subprocess
@@ -8,6 +12,9 @@ import uuid
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--implementer", choices=("codex", "claude"), default="codex")
+    options = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     target = project / ".harness" / "demos" / ("new-project-" + uuid.uuid4().hex[:12])
     target.mkdir(parents=True)
@@ -22,7 +29,8 @@ def main():
             result = {"status": "error", "message": process.stderr or process.stdout}
         return process.returncode, result
 
-    code, initialization = call("init", "--brief", str(project / "examples" / "new_project_brief.md"))
+    code, initialization = call("init", "--brief", str(project / "examples" / "new_project_brief.md"),
+                                "--implementer", options.implementer)
     if code:
         print(json.dumps(initialization, ensure_ascii=False, indent=2))
         return code

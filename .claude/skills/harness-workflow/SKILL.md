@@ -50,7 +50,9 @@ Use `doctor --provider codex` for a Codex-only workflow. Doctor is a local prefl
 not confirm remaining usage or perform a model request. Do not install tools, change models,
 or log in on the user's behalf merely because doctor reports a problem.
 
-For Claude design and review the manifest uses `agent.workflow = "claude-codex"`. Respect
+For Claude design and review the manifest uses `agent.workflow = "claude-codex"`; `"claude"` makes
+Claude the implementer too (no Codex needed; `init --implementer claude` creates it). With `claude`,
+suggest a different `--review-model` from `--implement-model` so review stays independent. Respect
 `code_paths`, `test_paths` and the contract. Do not edit tests, evidence or commands to obtain
 a pass. Harness refuses a second `run`, `agent` or `init` in the same project with
 `project_locked`; wait for the first command and never delete `.harness/lock` to get past it.
@@ -68,6 +70,7 @@ Harness has no resume operation; a new invocation starts with fresh verification
 | `interrupted` | Inspect changes and saved phase status before a fresh run. No automatic rollback or session resume is implied. |
 | `invalid_response` | One format-only repair has already been attempted. Inspect original logs and `repair/`; do not blindly repeat implementation. |
 | `agent_missing` | Name the `missing` CLIs and the login command; nothing ran yet. Do not install or log in for the user. |
+| `agent_outdated` | The claude implementer needs the `minimum` Claude Code version; ask the user to update it. |
 | `project_locked` | Another harness command owns the project (`lock_owner`). Wait or ask; do not delete lock files. |
 | `agent_exit`, `agent_timeout`, `verification_setup` | Read phase logs or the verification record, then use doctor for local setup issues. Do not loop on authentication, usage limits or timeouts. |
 | `no_progress`, `attempt_limit`, `review_rejected` | Explain remaining failed checks or actionable review findings; do not keep extending the attempt limit without addressing the cause. |

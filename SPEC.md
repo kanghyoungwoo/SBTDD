@@ -4,7 +4,7 @@
 
 요구사항(SDD), 비즈니스 시나리오(BDD), 테스트 실행 결과를 연결한다.
 개발자와 AI 실행기는 같은 CLI와 JSON 결과를 사용한다.
-이번 버전은 로컬 단일 실행과 Claude 설계·검토, Codex 구현을 통한 요구사항 하나의 개발 루프를 대상으로 한다.
+이번 버전은 로컬 단일 실행과 Claude 설계·검토, Codex 또는 Claude 구현을 통한 요구사항 하나의 개발 루프를 대상으로 한다.
 
 Python 3.11 이상과 표준 라이브러리로 구현한다. 프로젝트별 계약은
 `harness.json`에 저장한다. 기존 명세를 기준으로 Claude가 구현 계획과 결과를 검토한다.
@@ -34,7 +34,7 @@ Given/When/Then의 원본은 JSON이다. 별도 Gherkin 사본이나 파서를 �
 | REQ-STATE | 현재 입력에 대한 passed/failed/stale/unverified 상태를 검사·시나리오·요구사항별로 계산한다. |
 | REQ-EVIDENCE | 실행별 증거를 저장하며, 선택 실행과 실행 중 입력 변경을 처리한다. |
 | REQ-AGENT | 요구사항 하나를 선택해 테스트·구현·회귀 검증을 수행하고, 제한된 재시도와 중단 이유를 기록한다. |
-| REQ-ROLES | Claude 설계 → Codex 구현 → CLI 검증 → Claude 검토를 연결하고, 검사와 검토가 모두 통과해야 완료한다. |
+| REQ-ROLES | Claude 설계 → Codex 또는 Claude 구현 → CLI 검증 → Claude 검토를 연결하고, 검사와 검토가 모두 통과해야 완료한다. |
 | REQ-INIT | 빈 프로젝트의 자연어 요구를 명세·BDD·미구현 API·실패 테스트로 변환하고 기존 개발 루프에 연결한다. |
 | REQ-GUARD | AI 호출과 검사 실행 전후로 프로젝트와 증거 폴더를 비교해 허용 범위 밖 변경을 거부하고, 증거가 바뀌면 이력을 신뢰하지 않도록 표시한다. |
 | REQ-RECOVERY | 잘못된 AI 응답은 읽기 전용 형식 보정을 한 번만 시도하고, 중단 신호와 시간 초과에서는 자식 프로세스를 정리하고 중단을 기록한다. |
@@ -157,13 +157,17 @@ agent와 init이 호출하는 검증 CLI는 보유자가 넘긴 일회용 토큰
 아니면 항목별 reason과 action을 포함한 needs_input이다.
 
 agent와 init은 시작할 때 workflow에 필요한 CLI가 PATH에 있는지 먼저 확인한다. codex 흐름은 Codex,
-claude-codex 흐름과 init은 Claude와 Codex가 필요하다. 하나라도 없으면 기준 검사와 모델 호출 전에
-`agent_missing`과 `missing` 목록으로 끝난다.
+claude-codex 흐름과 기본 init은 Claude와 Codex, claude 흐름과 `init --implementer claude`는 Claude만
+필요하다. 하나라도 없으면 기준 검사와 모델 호출 전에 `agent_missing`과 `missing` 목록으로 끝난다.
+Claude가 구현을 맡으면 `--restricted`를 지원하는 Claude Code 2.1.248 이상이어야 한다. 버전이 낮으면
+같은 시점에 `agent_outdated`로 끝나고, 버전을 읽을 수 없으면 막지 않는다. doctor는 계약의 workflow가
+claude일 때 `claude.writer` 항목으로 이 버전을 확인한다.
 
 ## 신규 프로젝트 초기화 계약
 
 ```text
 python -m harness --root PROJECT init --brief FILE [--timeout-seconds 300]
+    [--implementer codex|claude] [--review-model MODEL] [--implement-model MODEL]
 ```
 
 FILE은 현재 작업 디렉터리 기준 UTF-8 자연어 요구 파일이다. PROJECT는 아직 없거나
@@ -181,9 +185,9 @@ needs_input이다. 브리프가 정하지 않은 내용은 질문하거나, 사�
 
 초안은 `.harness/init-runs/<session-id>/draft/`에서 생성한다. BRIEF.md는 입력의 사본,
 SPEC.md는 설계·요구사항·BDD의 문서, harness.json은 실행 가능한 계약이다. 추적 입력은
-이 두 Markdown 파일과 src/, tests/이며 workflow는 claude-codex다.
+이 두 Markdown 파일과 src/, tests/다. workflow는 claude-codex이며 `--implementer claude`이면 claude다.
 
-Codex scaffold 단계는 src/와 tests/에 새 파일만 추가한다. 공개 API는 import 가능하고
+scaffold 단계는 `--implementer`가 정한 Codex 또는 Claude가 맡으며 src/와 tests/에 새 파일만 추가한다. 공개 API는 import 가능하고
 미구현 동작은 src/에서 NotImplementedError를 발생시킨다. 테스트는 Given/When/Then의
 실제 기대 결과를 단정하며 TODO 실패, skip, expectedFailure, 구현 자체의 mock을 쓰지 않는다.
 초기 스캐폴드에서는 일반 unittest 테스트 메서드를 사용하고 subTest를 쓰지 않는다.
@@ -205,14 +209,15 @@ unexpected_outcomes, not_source_stub, unrecognized_output 또는 timeout 같은 
 
 ready(종료 코드 0)는 구현 준비 완료이며 테스트 상태는 failed다. needs_input은 1,
 error는 2다. ready 응답에 생성 파일, 요구사항 ID, fingerprint, red_check_ids와 첫 대상의
-next_command를 제공한다. init은 구현을 자동 시작하지 않으며 오류·질문·초안·로그는 보존한다.
+next_command를 제공한다. 모델 옵션을 지정했다면 next_command에도 같은 옵션을 붙인다.
+init은 구현을 자동 시작하지 않으며 오류·질문·초안·로그는 보존한다.
 새 호출은 새 초안을 만든다. agent는 기존과 같이 한 번에 요구사항 하나씩 처리한다.
 
 ## AI 실행기 계약
 
 ```text
 python -m harness [--root PROJECT] agent [--requirement ID]
-    [--max-attempts 3] [--timeout-seconds 300]
+    [--max-attempts 3] [--timeout-seconds 300] [--review-model MODEL] [--implement-model MODEL]
 ```
 
 프로젝트는 `harness.json`에 선택적인 `agent` 설정을 추가한다.
@@ -224,26 +229,39 @@ python -m harness [--root PROJECT] agent [--requirement ID]
 두 경로 목록은 비어 있을 수 없고, 서로 겹치지 않는 기존 파일·디렉터리여야 한다.
 `inputs`에서 추적하는 범위 안에 있어야 하며 `harness.json`은 수정 범위에 포함할 수 없다.
 기존 check/run/status는 agent 설정 없이 계속 사용할 수 있다.
-선택 필드 workflow는 codex 또는 claude-codex다. 생략 시 codex로 기존 동작을 유지한다.
+선택 필드 workflow는 다음 셋 중 하나다. 생략 시 codex로 기존 동작을 유지한다.
+
+| workflow | 설계·검토 | 테스트·구현 |
+| --- | --- | --- |
+| codex | 없음 | Codex |
+| claude-codex | Claude | Codex |
+| claude | Claude | Claude |
+
+아래에서 Claude 흐름은 claude-codex와 claude를, 구현자는 테스트·구현을 맡은 쪽을 뜻한다.
+`--review-model`은 Claude의 명세·설계·검토, `--implement-model`은 claude 흐름의 테스트·구현에 쓸
+모델이다. 지정하지 않으면 각 CLI의 설정 모델을 쓴다. 같은 모델 계열이 구현과 검토를 모두 맡으면
+같은 오해를 공유하기 쉬우므로 claude 흐름에서는 검토 모델을 구현 모델과 다르게 지정하는 것을 권한다.
+모델 옵션은 계약이 아니므로 harness.json에 두지 않고 run.json의 `models`에 기록한다. Codex 구현자에는
+`--implement-model`을 쓸 수 없고, codex 흐름에는 `--review-model`을 쓸 수 없다.
 
 실행 순서는 다음과 같다.
 
 1. 필요한 AI CLI를 확인한 뒤, 공통 CLI의 check, run, status를 호출해 전체 기준 결과를 새로 만든다.
 2. 요구사항을 지정하지 않으면 명세 순서대로 첫 실패 요구사항을 선택한다.
-   codex 흐름은 이미 통과한 대상을 AI 없이 종료한다. claude-codex 흐름에서 모두
+   codex 흐름은 이미 통과한 대상을 AI 없이 종료한다. Claude 흐름에서 모두
    통과했으면 requirement_required로 대상 선택을 요청한다. 명시적으로 선택한 대상은
    Claude 설계·검토를 실행하며 승인 없이는 완료하지 않는다.
    Claude 설계는 기존 명세와 코드에서 구현 단계와 테스트 전략을 읽기 전용으로 생성한다.
-3. 테스트 단계에서 Codex가 실패 이유를 검토하고 필요한 테스트를 추가한다.
+3. 테스트 단계에서 구현자가 실패 이유를 검토하고 필요한 테스트를 추가한다.
    기존 테스트의 기대 결과 변경을 막기 위해 새 파일 추가만 허용한다.
    이미 충분한 실패 테스트가 있으면 그대로 사용한다.
-4. 선택한 요구사항을 다시 실행한다. Codex가 지목한 검사에 일반적인 비영 종료 코드가
+4. 선택한 요구사항을 다시 실행한다. 구현자가 지목한 검사에 일반적인 비영 종료 코드가
    관측되어야 구현 단계로 진행한다. 실행 실패·시간 초과는 Red 증거로 사용하지 않는다.
 5. 구현 단계는 code_paths의 파일만 수정한다. 테스트와 나머지 추적 입력은 고정한다.
 6. 구현 후 전체 검사를 실행한다. 선택한 요구사항이 통과하고, 기준 실행에서
-   통과했던 검사에 회귀가 없으면 codex 흐름은 완료한다. claude-codex 흐름은 Claude가
+   통과했던 검사에 회귀가 없으면 codex 흐름은 완료한다. Claude 흐름은 Claude가
    명세·설계·테스트·기준 실행 이후 diff·검사 기록을 검토하고 approved여야 완료한다.
-7. 남은 실패, 회귀, 검토 수정 요청을 다음 Codex 시도에 전달한다. 구현 시도 상한은
+7. 남은 실패, 회귀, 검토 수정 요청을 다음 구현 시도에 전달한다. 구현 시도 상한은
    기본 3회이며 검토 재작업도 같은 한도를 사용한다. 변경 없는 재시도는 no_progress다.
    테스트 통과 상태에서 마지막 검토가 수정을 요청하면 review_rejected로 실패한다.
 
@@ -271,7 +289,7 @@ findings(path/issue/change)를 반환한다. 승인은 빈 findings, 수정 요�
 | passed | 대상 요구사항 통과, 기존 통과 검사에 회귀 없음, Claude 흐름이면 검토 승인 |
 | needs_input | 질문, 명세·허용 범위 위반, 증거 변경, Red 부재, 실행 중 입력 변경, 검사 실행 환경 문제, 중단 신호 |
 | failed | 시도 한도 도달, 검토 수정 요청 미해결, 코드 변경 없는 반복 |
-| error | 필요한 AI CLI 없음, AI 실행 실패·시간 초과·잘못된 응답, 검증 CLI 오류, 다른 명령의 잠금 |
+| error | 필요한 AI CLI 없음·버전 부족, AI 실행 실패·시간 초과·잘못된 응답, 검증 CLI 오류, 다른 명령의 잠금 |
 
 종료 코드는 passed=0, needs_input/failed=1, error=2다.
 중단 시 수정 내용을 자동으로 되돌리지 않고 이유와 변경 파일 목록을 기록한다.
@@ -281,7 +299,7 @@ findings(path/issue/change)를 반환한다. 승인은 빈 findings, 수정 요�
 `.harness/agent-runs/<session-id>/run.json`에 단계, 검증 실행 ID, 시도 횟수,
 선택 요구사항, 전체 프로젝트 상태와 중단 이유를 저장한다. AI 호출마다 prompt,
 JSON 응답, 표준 출력·오류를 같은 세션 폴더에 저장한다.
-workflow, 단계별 provider, review_status를 기록하고 승인 시 review_fingerprint를 저장한다.
+workflow, implementer, models, 단계별 provider, review_status를 기록하고 승인 시 review_fingerprint를 저장한다.
 Claude 호출 전후의 추적 입력은 검증 기록의 fingerprint_after와 같아야 한다.
 검토 중 입력 변경은 승인을 무효화한다. 설계·검토에서 추적 파일을 수정하면 중단한다.
 검토에는 전체 검사 결과와 기준 실행 이후 변경 diff를 제공한다. 설계와 검토는 새 세션이다.
@@ -300,11 +318,19 @@ SIGINT와 처리 가능한 SIGTERM은 run, agent, init에서 interrupted로 기�
 않을 때만 원래 작업을 반복하지 않는 형식 보정을 한 번 호출한다. Codex 보정은 read-only sandbox,
 Claude 보정은 도구 없이 실행하고 보정 중 프로젝트 변경은 scope_changed다. 보정 자료는 단계 폴더의
 `repair/`에 저장하며, 보정 결과도 맞지 않으면 invalid_response로 끝난다.
-Claude는 저장된 로그인을 사용하며 --safe-mode, 읽기 도구 Read/Glob/Grep만 제공,
+Claude는 저장된 로그인을 사용하며 명세·설계·검토에서는 --safe-mode, 읽기 도구 Read/Glob/Grep만 제공,
 dontAsk, --no-session-persistence로 호출한다. MCP 도구는 허용하지 않는다.
+
+Claude가 구현자일 때는 같은 설정에 `--restricted`와 `--strict-mcp-config`를 더하고, 도구는
+Read/Glob/Grep/Edit/Write만 준다. `--restricted`는 Bash·PowerShell 같은 명령·코드 실행 도구와
+WebFetch를 빼고 파일 도구를 작업 폴더로 제한하며 bypassPermissions를 거부한다. 편집 허용 규칙은
+단계의 경로로만 만든다(테스트 단계는 test_paths, 구현 단계는 code_paths, scaffold는 src와 tests,
+예: `Edit(./src/**)`). 규칙 밖의 편집은 dontAsk가 거부한다. Claude 구현자는 명령을 실행할 수 없으므로
+테스트를 직접 돌리지 않고, Harness가 실행한 결과를 다음 시도에서 받는다. 이 도구 제한은 1차 방어이며,
+Codex와 같은 변경 감지·증거 보호가 최종 판정이다. 형식 보정은 도구와 편집 규칙 없이 실행한다.
 관리 정책은 유지되며 이 도구 제한과 추적 파일 비교가 OS 보안 격리를 대체하지 않는다.
 
-Codex 응답은 `outcome`(continue/needs_input), `summary`, `question`, `red_check_ids`다.
+구현자의 응답(Codex·Claude 공통)은 `outcome`(continue/needs_input), `summary`, `question`, `red_check_ids`다.
 질문은 needs_input일 때 필수이며, 테스트 단계의 continue는 실패 검사 ID를 포함해야 한다.
 실제 실패를 assertion 오류로 해석하는 판단은 여전히 모델과 검토자의 책임이다.
 실행기는 테스트 단계와 구현 단계를 분리하고 관측된 실패·통과를 기록한다.
@@ -316,12 +342,13 @@ CLI를 외부 프로세스로 호출하는 인수 테스트로 정상·누락·�
 하네스 자신의 `harness.json`도 같은 CLI로 검증한다.
 
 실행기 테스트는 AI 응답을 대체하면서 실제 공통 CLI를 호출해 상태 전이를 확인한다.
-Codex와 Claude 어댑터는 인자·표준 입력·구조화된 응답·오류 처리를 검증하고,
+Codex와 Claude(읽기 전용·구현) 어댑터는 인자·표준 입력·구조화된 응답·오류 처리를 검증하고,
 역할별 실행 순서, 거절 후 재검증, 질문·보호 파일·입력 변경 중단을 검증한다.
 변경 감지·증거 보호, 형식 보정·중단, 사전 점검은 `tests/test_hardening.py`, 잠금은
 `tests/test_lock.py`가 검증한다. 저장소의 모든 테스트는 `harness.json`의 검사 하나 이상에
 연결되어야 하며, 연결되지 않은 테스트가 있으면 REQ-LINK 검사가 실패한다.
-별도 재고 예제에서 실제 Claude 설계·검토와 Codex 구현 연결을 확인한다. 외부 모델을 사용하는 검사는 기본 테스트 실행에 포함하지 않는다.
+별도 재고 예제에서 실제 Claude 설계·검토와 Codex 또는 Claude 구현 연결을 확인한다(`--implementer claude`).
+외부 모델을 사용하는 검사는 기본 테스트 실행에 포함하지 않는다.
 
 기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.5 범위에 포함하지 않는다.
 SIGHUP 처리, Windows 프로세스의 단계적 종료, 잠금 대기도 이번 범위가 아니다.

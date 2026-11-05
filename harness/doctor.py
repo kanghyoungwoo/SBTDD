@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 
+from .agent import CLAUDE_WRITER_MINIMUM, parse_version
 from .core import fingerprint, load_manifest
 from .guard import check_integrity
 
@@ -27,9 +28,11 @@ def run_doctor(root, provider='all'):
         add('evidence', True, 'integrity')
     except (ValueError, OSError) as error:
         add('evidence', False, 'integrity', str(error))
+    workflow = None
     if (root / 'harness.json').exists():
         try:
             manifest = load_manifest(root)
+            workflow = manifest.get('agent', {}).get('workflow')
             current = fingerprint(root, manifest)
             add('contract', True, 'valid', fingerprint=current)
         except (ValueError, OSError) as error:
@@ -52,6 +55,13 @@ def run_doctor(root, provider='all'):
                 if stage == 'version':
                     add(name + '.cli', process.returncode == 0, 'version', f'Check the {name} installation.',
                         executable=executable, version=process.stdout.strip()[:200])
+                    version = parse_version(process.stdout) if process.returncode == 0 else None
+                    if name == 'claude' and workflow == 'claude' and version is not None:
+                        needed = '.'.join(map(str, CLAUDE_WRITER_MINIMUM))
+                        recent = version >= CLAUDE_WRITER_MINIMUM
+                        add('claude.writer', recent, 'writer_supported' if recent else 'version_too_old',
+                            f'The claude workflow needs Claude Code {needed} or newer; update Claude Code.',
+                            minimum=needed)
                 else:
                     logged_in = process.returncode == 0
                     if name == 'claude' and logged_in:
