@@ -1136,9 +1136,10 @@ def _q(value: Decimal, exp: str, mode) -> Decimal:
     return value.quantize(Decimal(exp), rounding=mode)
 
 
-def _reconcile(store: Store, broker, config: Config) -> None:
+def _reconcile(store: Store, broker, config: Config, now, tz) -> None:
     from decimal import ROUND_CEILING, ROUND_HALF_UP
 
+    linked: set[str] = set()
     fee_pct = _cfg_num(config.raw, "costs.buy_fee_pct")
     pending = [o for o in store._orders_raw()
                if o["status"] in ("SENT", "SENDING", "UNKNOWN")]
@@ -1153,6 +1154,29 @@ def _reconcile(store: Store, broker, config: Config) -> None:
                 match = b
                 break
         if match is None:
+            used = {x["broker_order_id"] for x in store._orders_raw()
+                    if x["broker_order_id"]} | linked
+            for b in cache[td]:
+                if (b.symbol == "QQQ" and b.side == "BUY"
+                        and b.quantity == Decimal(o["quantity"])
+                        and b.limit_price == Decimal(o["limit_price"])
+                        and b.broker_order_id not in used):
+                    match = b
+                    break
+        if match is not None:
+            linked.add(match.broker_order_id)
+        if match is None:
+            if o["status"] == "SENDING":
+                store._set_order_status(o["id"], "UNKNOWN")
+            row = store._conn.execute(
+                "SELECT close_time FROM calendar WHERE date = ?", (td,)).fetchone()
+            if row is not None and row[0]:
+                close_t = dt.datetime.strptime(row[0], "%H:%M").time()
+                close_dt = dt.datetime.combine(
+                    dt.date.fromisoformat(td), close_t, tzinfo=tz)
+                if (now.astimezone(tz) >= close_dt
+                        and broker.get_position("QQQ") == store.holdings()):
+                    store._set_order_status(o["id"], "NOT_PLACED")
             continue
         if match.status == "OPEN":
             if o["status"] != "SENT":
@@ -1206,7 +1230,7 @@ def _run_once_body(config, store, broker, notifier, now, tz, ny_date):
         return finish(2, "NO_BROKER_ADAPTER")
 
     try:
-        _reconcile(store, broker, config)
+        _reconcile(store, broker, config, now, tz)
         position = broker.get_position("QQQ")
     except BrokerError:
         return finish(2, "BROKER_ERROR")
@@ -1375,7 +1399,7 @@ class FakeBroker:
     def place_loc_buy(self, request: OrderRequest) -> str:
         self.place_calls += 1
         mode, self._fail_mode = self._fail_mode, None
-        if mode == "timeout":
+        if mode in ("timeout", "timeout_before_accept"):
             raise BrokerTimeout("timeout")
         if mode == "reject":
             raise BrokerRejected("rejected")
