@@ -569,7 +569,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
                 patch('harness.__main__.load_manifest', side_effect=AssertionError('No required contract')), \
                 patch('builtins.print'):
             self.assertEqual(main(), 0)
-        doctor.assert_called_once_with(self.root, 'codex')
+        doctor.assert_called_once_with(self.root, 'codex', python=None)
 
     def test_verifier_timeout_cleans_up_process_tree(self):
         from harness.processes import run_command

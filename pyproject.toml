@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sdd-bdd-tdd-harness"
-version = "0.5.0"
+version = "0.6.0"
 description = "Trace requirements, business scenarios, and test evidence."
 requires-python = ">=3.11"
 dependencies = []
@@ -14,3 +14,13 @@ harness = "harness.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
+
+# Development only: the harness itself runs on the standard library alone.
+[dependency-groups]
+dev = ["mypy==2.3.1"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["harness", "tools"]
+strict = true
+warn_unreachable = true

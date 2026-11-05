@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "inputs": ["harness", "tests", "SPEC.md", "pyproject.toml"],
+  "inputs": ["harness", "tests", "tools", "SPEC.md", "pyproject.toml"],
   "agent": {"workflow": "claude-codex", "code_paths": ["harness"], "test_paths": ["tests"]},
   "requirements": [
     {"id": "REQ-LINK", "description": "요구사항, 시나리오, acceptance 검사 간 연결과 계약 형식을 검증한다."},
@@ -13,7 +13,9 @@
     {"id": "REQ-GUARD", "description": "AI 호출과 검사 실행 전후로 프로젝트와 증거 폴더를 비교해 허용 범위 밖 변경을 거부하고, 증거가 바뀌면 이력을 신뢰하지 않도록 표시한다."},
     {"id": "REQ-RECOVERY", "description": "잘못된 AI 응답은 읽기 전용 형식 보정을 한 번만 시도하고, 중단 신호와 시간 초과에서는 자식 프로세스를 정리하고 중단을 기록한다."},
     {"id": "REQ-PREFLIGHT", "description": "모델을 호출하지 않고 로컬 CLI·로그인·프로젝트를 점검하며, 필요한 AI CLI가 없으면 검사와 모델 호출 전에 중단한다."},
-    {"id": "REQ-LOCK", "description": "실행 기록을 쓰는 명령은 프로젝트마다 한 번에 하나만 실행하고, 거절된 명령은 증거를 바꾸지 않는다."}
+    {"id": "REQ-LOCK", "description": "실행 기록을 쓰는 명령은 프로젝트마다 한 번에 하나만 실행하고, 거절된 명령은 증거를 바꾸지 않는다."},
+    {"id": "REQ-RUNTIME", "description": "Harness와 검증기는 Harness 자신의 인터프리터에서 실행하고, 검사 명령의 {python}은 --python으로 지정한 프로젝트 인터프리터로 치환한다. 검증기는 실행 환경의 사이트 훅(.pth, sitecustomize)을 실행하지 않으며, doctor는 프로젝트 안의 환경에서 Harness를 실행하거나 프로젝트 .venv를 쓰지 않는 구성을 알린다."},
+    {"id": "REQ-DIST", "description": "Harness를 프로젝트와 분리된 도구 환경(pipx, uv tool)에 설치하거나, 표준 라이브러리로 만든 단일 파일 harness.pyz로 실행할 수 있다. 같은 소스는 같은 바이트의 harness.pyz를 만든다."}
   ],
   "scenarios": [
     {"id": "SCN-VALID-TRACE", "requirement": "REQ-LINK", "given": "모든 요구사항이 시나리오와 acceptance 검사에 연결되어 있다", "when": "계약을 검사한다", "then": "연결 수와 valid 상태를 반환한다"},
@@ -62,7 +64,14 @@
     {"id": "SCN-PREFLIGHT-VERSION", "requirement": "REQ-PREFLIGHT", "given": "Claude 구현에 필요한 버전보다 낮은 Claude Code가 설치되어 있다", "when": "claude 흐름의 agent·init이나 doctor를 실행한다", "then": "기준 검사와 모델 호출 전에 agent_outdated로 끝나고 doctor는 claude.writer 실패와 조치를 보고한다"},
     {"id": "SCN-LOCK-CONCURRENT", "requirement": "REQ-LOCK", "given": "다른 run·agent·init이 실행 중이다", "when": "같은 프로젝트에서 run·agent·init을 시작한다", "then": "project_locked로 거절하고 증거와 무결성 표시를 바꾸지 않는다"},
     {"id": "SCN-LOCK-NESTED", "requirement": "REQ-LOCK", "given": "agent나 init이 잠금을 가진 채 검증 CLI를 호출한다", "when": "검증 CLI와 검사 명령이 실행된다", "then": "검증 CLI는 같은 잠금 아래에서 실행되고 AI 도구와 검사 명령은 잠금을 빌리지 못한다"},
-    {"id": "SCN-LOCK-RELEASE", "requirement": "REQ-LOCK", "given": "잠금을 가진 프로세스가 강제 종료되었다", "when": "새 명령을 시작한다", "then": "운영체제가 해제한 잠금을 바로 얻는다"}
+    {"id": "SCN-LOCK-RELEASE", "requirement": "REQ-LOCK", "given": "잠금을 가진 프로세스가 강제 종료되었다", "when": "새 명령을 시작한다", "then": "운영체제가 해제한 잠금을 바로 얻는다"},
+    {"id": "SCN-RUNTIME-PYTHON", "requirement": "REQ-RUNTIME", "given": "검사 명령이 {python}으로 프로젝트 가상환경에만 있는 모듈을 import하고, Harness는 다른 Python으로 실행한다", "when": "run을 --python 없이, 그리고 --python <가상환경 Python 경로> 또는 PATH의 이름으로 실행한다", "then": "--python 없이는 검사가 실패하고, --python이 있으면 통과하며 검사 명령과 실행 기록의 interpreters.checks에 심볼릭 링크를 풀지 않은 가상환경 경로가 남는다"},
+    {"id": "SCN-RUNTIME-REJECT", "requirement": "REQ-RUNTIME", "given": "--python이 없는 파일, PATH에 없는 이름 또는 디렉터리를 가리킨다", "when": "run을 실행한다", "then": "검사를 실행하지 않고 --python 오류(종료 코드 2)로 끝나며 .harness를 만들지 않는다"},
+    {"id": "SCN-RUNTIME-PROPAGATE", "requirement": "REQ-RUNTIME", "given": "agent와 init을 --python과 함께 실행한다", "when": "검증기가 기준·Red·검증 실행을 기록한다", "then": "모든 실행 기록과 agent run.json의 interpreters.checks가 지정한 인터프리터이고, init의 next_command는 agent 앞에 같은 --python을 붙인다"},
+    {"id": "SCN-RUNTIME-SITE", "requirement": "REQ-RUNTIME", "given": "Harness를 실행하는 가상환경의 site-packages에 가짜 검증 결과를 출력하고 끝나는 .pth 파일이 있다", "when": "agent·init이 쓰는 검증 CLI를 호출한다", "then": "검증기는 -I -S로 실행되어 .pth를 실행하지 않고 실제 계약 검증 결과를 반환한다"},
+    {"id": "SCN-RUNTIME-DOCTOR", "requirement": "REQ-RUNTIME", "given": "Harness 인터프리터의 환경이 프로젝트 안에 있거나, 프로젝트에 .venv가 있는데 --python을 주지 않았다", "when": "doctor를 실행한다", "then": "isolation 항목은 inside_project, project.python 항목은 project_venv_not_selected로 실패하고 --python 사용을 안내한다. --python을 주면 그 인터프리터의 버전을 보고한다"},
+    {"id": "SCN-DIST-ZIPAPP", "requirement": "REQ-DIST", "given": "tools/build_zipapp.py로 만든 harness.pyz", "when": "python -I -S harness.pyz로 run을 실행하고, 같은 아카이브에서 검증 CLI와 재실행 명령을 구한다", "then": "검사가 통과하고 검증 CLI가 아카이브의 패키지로 동작하며 재실행 명령은 [python, harness.pyz]다"},
+    {"id": "SCN-DIST-REPRODUCIBLE", "requirement": "REQ-DIST", "given": "같은 harness 소스", "when": "harness.pyz를 두 번 만든다", "then": "두 파일의 바이트가 같고 __main__.py와 harness/*.py만 들어 있다"}
   ],
   "checks": [
     {
@@ -157,6 +166,22 @@
       "timeout_seconds": 180,
       "command": ["{python}", "-B", "-m", "unittest", "-v",
         "tests.test_lock"]
+    },
+    {
+      "id": "CHK-RUNTIME", "kind": "acceptance",
+      "scenarios": ["SCN-RUNTIME-PYTHON", "SCN-RUNTIME-REJECT", "SCN-RUNTIME-PROPAGATE", "SCN-RUNTIME-SITE", "SCN-RUNTIME-DOCTOR"],
+      "timeout_seconds": 180,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_runtime.ProjectInterpreterTests",
+        "tests.test_runtime.PropagationTests",
+        "tests.test_runtime.VerifierIsolationTests",
+        "tests.test_runtime.DoctorIsolationTests"]
+    },
+    {
+      "id": "CHK-DIST", "kind": "acceptance", "scenarios": ["SCN-DIST-ZIPAPP", "SCN-DIST-REPRODUCIBLE"],
+      "timeout_seconds": 120,
+      "command": ["{python}", "-B", "-m", "unittest", "-v",
+        "tests.test_runtime.ZipappTests"]
     }
   ]
 }

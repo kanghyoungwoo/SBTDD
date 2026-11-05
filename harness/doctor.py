@@ -2,25 +2,59 @@
 
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
+from typing import Any
 
 from .agent import CLAUDE_WRITER_MINIMUM, parse_version
-from .core import fingerprint, load_manifest
+from .core import JSON, fingerprint, load_manifest
 from .guard import check_integrity
+from .processes import NO_WINDOW
+from .runtime import environment_inside, project_environment, same_path
 
 
-def run_doctor(root, provider='all'):
-    checks = []
+VERSION_SCRIPT = "import sys; print('.'.join(map(str, sys.version_info[:3])))"
 
-    def add(name, passed, reason, action='', **details):
+
+def run_doctor(root: Path, provider: str = 'all', python: str | None = None) -> JSON:
+    checks: list[JSON] = []
+
+    def add(name: str, passed: bool, reason: str, action: str = '', **details: Any) -> None:
         checks.append({'id': name, 'status': 'passed' if passed else 'failed',
                        'reason': reason, 'action': '' if passed else action, **details})
 
     add('python', sys.version_info >= (3, 11), 'version', 'Use Python 3.11 or newer.',
         version='.'.join(map(str, sys.version_info[:3])), executable=sys.executable)
     parent = root if root.exists() else next(p for p in root.parents if p.exists())
+    inside = environment_inside(root)
+    # Site hooks (.pth, sitecustomize) of the harness's own environment run inside the harness.
+    add('isolation', inside is None, 'separate_environment' if inside is None else 'inside_project',
+        'Run the harness from its own environment (pipx, uv tool or harness.pyz) and pass the '
+        'project interpreter with --python.', environment=str(inside or sys.prefix))
+    venv = project_environment(root) if root.is_dir() else None
+    if python is not None:
+        try:
+            process = subprocess.run(
+                [python, '-I', '-c', VERSION_SCRIPT], cwd=parent, capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=15,
+                creationflags=NO_WINDOW,
+            )
+            add('project.python', process.returncode == 0, 'version', f'Check that {python} runs.',
+                executable=python, source='--python', version=process.stdout.strip()[:50])
+        except subprocess.TimeoutExpired:
+            add('project.python', False, 'timeout', f'Check {python} locally; timed out after 15 seconds.',
+                executable=python)
+        except OSError:
+            add('project.python', False, 'launch_error', f'Check permissions of {python}.', executable=python)
+    elif venv is not None and not same_path(venv, sys.executable):
+        add('project.python', False, 'project_venv_not_selected',
+            f'Checks would run on {sys.executable}; pass --python {venv} to use the project environment.',
+            executable=sys.executable, project_venv=venv)
+    else:
+        add('project.python', True, 'harness_interpreter', executable=sys.executable,
+            source='harness', version='.'.join(map(str, sys.version_info[:3])))
     add('workspace', parent.is_dir() and os.access(parent, os.R_OK | os.W_OK), 'access',
         'Use an accessible project directory.', path=str(root))
     try:
@@ -50,7 +84,7 @@ def run_doctor(root, provider='all'):
                 process = subprocess.run(
                     [executable, *args], cwd=parent, capture_output=True, text=True, encoding='utf-8',
                     errors='replace', timeout=15,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    creationflags=NO_WINDOW,
                 )
                 if stage == 'version':
                     add(name + '.cli', process.returncode == 0, 'version', f'Check the {name} installation.',

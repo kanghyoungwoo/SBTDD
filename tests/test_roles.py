@@ -260,7 +260,7 @@ class ClaudeWorkflowTests(unittest.TestCase):
                 patch("harness.__main__.run_agent", return_value={"status": "passed"}) as develop, \
                 patch("builtins.print"):
             self.assertEqual(main(), 0)
-        self.assertEqual(develop.call_args.kwargs, {"review_model": "opus", "implement_model": "sonnet"})
+        self.assertEqual(develop.call_args.kwargs, {"review_model": "opus", "implement_model": "sonnet", "python": None})
 
     def test_claude_workflow_is_a_valid_contract(self):
         self.assertEqual(self.cli("check")["status"], "valid")

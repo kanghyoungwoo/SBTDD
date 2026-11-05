@@ -1,8 +1,8 @@
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
 import difflib
 from functools import partial
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -10,16 +10,22 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any
 import uuid
 
-from .core import EXCLUDED, HarnessError, fields, fingerprint, input_files, is_text, require, status_from_latest
+from .core import (EXCLUDED, JSON, HarnessError, fields, fingerprint, input_files, is_text, require,
+                   status_from_latest)
 from .guard import (changed_paths, check_integrity, is_benign_change, is_os_metadata, mark_integrity_violation,
                     plain_path, tree_snapshot)
 from .lock import TOKEN_VARIABLE, environment, held_token, project_lock
-from .processes import interrupt_on_term, run_command, terminate_tree
+from .processes import NEW_GROUP, NO_WINDOW, interrupt_on_term, run_command, terminate_tree
+from .runtime import package_root
+
+# An AI adapter: (project root, context, staging folder, timeout seconds) -> validated response.
+Invoker = Callable[[Path, JSON, Path, int], JSON]
 
 
-RESPONSE_SCHEMA = {
+RESPONSE_SCHEMA: JSON = {
     "type": "object",
     "properties": {
         "outcome": {"type": "string", "enum": ["continue", "needs_input"]},
@@ -80,30 +86,30 @@ CLAUDE_WRITER_MINIMUM = (2, 1, 248)
 
 
 class AgentError(HarnessError):
-    def __init__(self, reason, message, status="error", **details):
+    def __init__(self, reason: str, message: str, status: str = "error", **details: Any) -> None:
         super().__init__(message)
         self.reason = reason
         self.status = status
         self.details = details
 
 
-def parse_version(text):
+def parse_version(text: str | None) -> tuple[int, ...] | None:
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
     return tuple(int(part) for part in match.groups()) if match else None
 
 
-def cli_version(executable):
+def cli_version(executable: str) -> tuple[int, ...] | None:
     """(major, minor, patch) from '<cli> --version', or None when it cannot be read."""
     try:
         output = subprocess.run([executable, "--version"], capture_output=True, text=True, encoding="utf-8",
                                 errors="replace", timeout=15, env=environment(),
-                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0).stdout
+                                creationflags=NO_WINDOW).stdout
     except (OSError, subprocess.TimeoutExpired):
         return None
     return parse_version(output)
 
 
-def require_providers(names, claude_writer=False):
+def require_providers(names: list[str], claude_writer: bool = False) -> None:
     """Stop before baseline checks or paid model calls when a CLI the workflow needs is missing."""
     missing = [name for name in names if shutil.which(name) is None]
     if missing:
@@ -112,7 +118,7 @@ def require_providers(names, claude_writer=False):
                          "'harness doctor' checks the local setup.", missing=missing)
     if claude_writer:
         # An unreadable version is not a refusal; an unsupported flag then fails the first call visibly.
-        version = cli_version(shutil.which("claude"))
+        version = cli_version(shutil.which("claude") or "claude")
         if version is not None and version < CLAUDE_WRITER_MINIMUM:
             needed, found = (".".join(map(str, value)) for value in (CLAUDE_WRITER_MINIMUM, version))
             raise AgentError("agent_outdated", f"The claude implementer needs Claude Code {needed} or newer "
@@ -120,7 +126,7 @@ def require_providers(names, claude_writer=False):
                              version=found, minimum=needed)
 
 
-def write_json(path, value):
+def write_json(path: Path, value: Any) -> None:
     plain_path(path)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -134,7 +140,7 @@ def write_json(path, value):
             time.sleep(0.05 * (2 ** attempt))
 
 
-def validate_response(value):
+def validate_response(value: Any) -> JSON:
     try:
         fields(value, set(RESPONSE_SCHEMA["required"]), set(), "agent response")
         require(value["outcome"] in ("continue", "needs_input"), "Unknown outcome")
@@ -145,18 +151,18 @@ def validate_response(value):
         require(value["outcome"] != "needs_input" or is_text(value["question"]), "Missing question")
     except HarnessError as error:
         raise AgentError("invalid_response", str(error)) from error
-    return value
+    response: JSON = value
+    return response
 
 
-def run_process(root, command, prompt, directory, timeout, label):
+def run_process(root: Path, command: list[str], prompt: str, directory: Path, timeout: int, label: str) -> str:
     output, errors = "", ""
-    process = None
+    process: subprocess.Popen[str] | None = None
     try:
         process = subprocess.Popen(
             command, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt",
-            env=environment(PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8"),
-            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == "nt" else 0,
+            text=True, encoding="utf-8", errors="replace", start_new_session=sys.platform != "win32",
+            env=environment(PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8"), creationflags=NEW_GROUP,
         )
         try:
             output, errors = process.communicate(input=prompt, timeout=timeout)
@@ -181,7 +187,7 @@ def run_process(root, command, prompt, directory, timeout, label):
         (directory / "stderr.log").write_text(errors, encoding="utf-8")
 
 
-def invoke_codex(root, context, directory, timeout):
+def invoke_codex(root: Path, context: JSON, directory: Path, timeout: int) -> JSON:
     executable = shutil.which("codex")
     if executable is None:
         raise AgentError("agent_missing", "Codex CLI is not on PATH. Install it and run 'codex login'.")
@@ -193,18 +199,21 @@ def invoke_codex(root, context, directory, timeout):
                "--ephemeral", "--skip-git-repo-check", "--color", "never",
                "--output-schema", str(directory / "schema.json"), "-"]
     output = run_process(root, command, prompt, directory, timeout, "Codex")
-    def repair(prompt, folder):
+    def repair(prompt: str, folder: Path) -> str:
         readonly = list(command)
         readonly[readonly.index("--sandbox") + 1] = "read-only"
         return run_process(root, readonly, prompt, folder, timeout, "Codex response repair")
 
-    response = parse_with_repair(root, output, lambda text: validate_response(json.loads(text)),
-                                 repair, directory, RESPONSE_SCHEMA)
+    def parse(text: str) -> JSON:
+        return validate_response(json.loads(text))
+
+    response = parse_with_repair(root, output, parse, repair, directory, RESPONSE_SCHEMA)
     write_json(directory / "response.json", response)
     return response
 
 
-def parse_with_repair(root, output, parse, repair, directory, schema):
+def parse_with_repair(root: Path, output: str, parse: Callable[[str], JSON], repair: Callable[[str, Path], str],
+                      directory: Path, schema: JSON) -> JSON:
     try:
         return parse(output)
     except (json.JSONDecodeError, AgentError) as error:
@@ -241,19 +250,30 @@ def parse_with_repair(root, output, parse, repair, directory, schema):
     return response
 
 
-def verification_cli(root, manifest, *arguments):
-    package_root = str(Path(__file__).resolve().parents[1])
-    bootstrap = "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module('harness',run_name='__main__')"
+BOOTSTRAP = "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module('harness',run_name='__main__')"
+
+
+def verification_cli(root: Path, manifest: JSON, *arguments: str) -> JSON:
+    """Run the harness CLI in a fresh, isolated interpreter and return its JSON result.
+
+    -I ignores PYTHONPATH, user site-packages and the working directory, so project files such as
+    harness.py or sitecustomize.py cannot replace the verifier. -S skips the site module, so .pth
+    files and sitecustomize of the environment the harness runs from do not execute either; the
+    verifier needs nothing but the standard library and the package path given explicitly.
+    """
+    location = package_root()
+    # The package lives in a directory, or in harness.pyz when run as a zipapp.
+    directory = location if location.is_dir() else location.parent
     timeout = sum(check.get("timeout_seconds", 30) for check in manifest["checks"]) + 30
     # Only the verifier started by the lock holder may run under that lock.
     token = held_token(root)
     try:
         process = run_command(
-            [sys.executable, "-I", "-B", "-c", bootstrap, package_root, "--root", str(root), *arguments], cwd=package_root,
-            env=environment(PYTHONIOENCODING="utf-8", **({TOKEN_VARIABLE: token} if token else {})),
+            [sys.executable, "-I", "-S", "-B", "-c", BOOTSTRAP, str(location), "--root", str(root), *arguments],
+            cwd=directory, env=environment(PYTHONIOENCODING="utf-8", **({TOKEN_VARIABLE: token} if token else {})),
             text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
-        value = json.loads(process.stdout)
+        value: JSON = json.loads(process.stdout)
         require(isinstance(value, dict) and value.get("schema_version") == 1, "Invalid verifier response")
         require(process.returncode in (0, 1) and value.get("status") in
                 ("valid", "passed", "failed", "stale", "unverified"),
@@ -263,29 +283,31 @@ def verification_cli(root, manifest, *arguments):
         raise AgentError("verification_error", str(error)) from error
 
 
-def snapshot(root):
+def snapshot(root: Path) -> dict[str, str]:
     return tree_snapshot(root, excluded=[root / ".harness"])
 
 
-def split_changes(before, after):
+def split_changes(before: dict[str, str], after: dict[str, str]) -> tuple[list[str], list[str]]:
     """Separate changes the scope check judges from benign ones it only reports."""
-    changed, ignored = [], []
+    changed: list[str] = []
+    ignored: list[str] = []
     for name in changed_paths(before, after):
         benign = is_benign_change(name) and not after.get(name, "").startswith("link:")
         (ignored if benign else changed).append(name)
     return changed, ignored
 
 
-def ignored_details(ignored):
+def ignored_details(ignored: list[str]) -> JSON:
     return {"ignored_changes": ignored[:20], "ignored_change_count": len(ignored)} if ignored else {}
 
 
-def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, allowed=(), add_only=False):
+def guarded_invoke(root: Path, evidence_root: Path, invoke: Invoker, context: JSON, directory: Path, timeout: int,
+                   allowed: Sequence[str] = (), add_only: bool = False) -> tuple[JSON, list[str], list[str]]:
     """Keep provider artifacts separate while checking workspace and evidence changes."""
     evidence = evidence_root / ".harness"
     excluded = [root] if root.is_relative_to(evidence) else []
     before = snapshot(root)
-    def evidence_snapshot():
+    def evidence_snapshot() -> dict[str, str]:
         state = tree_snapshot(evidence, excluded=excluded)
         if excluded:
             # A draft lives under the outer evidence folder, but has its own run history.
@@ -296,7 +318,7 @@ def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, all
     evidence_before = evidence_snapshot()
     staging = Path(tempfile.gettempdir()) / ("harness-output-" + uuid.uuid4().hex)
     staging.mkdir()
-    changed = []
+    changed: list[str] = []
     try:
         try:
             response = invoke(root, context, staging, timeout)
@@ -333,7 +355,7 @@ def guarded_invoke(root, evidence_root, invoke, context, directory, timeout, all
         shutil.rmtree(staging)
 
 
-def copy_artifacts(source_directory, destination):
+def copy_artifacts(source_directory: Path, destination: Path) -> None:
     plain_path(destination)
     for source in source_directory.rglob("*"):
         plain_path(source)
@@ -341,28 +363,28 @@ def copy_artifacts(source_directory, destination):
     shutil.copytree(source_directory, destination, dirs_exist_ok=True)
 
 
-def current_state(manifest, record):
+def current_state(manifest: JSON, record: JSON) -> JSON:
     return status_from_latest(manifest, record["fingerprint_after"],
                               {r["id"]: (record, r) for r in record["results"]})
 
 
-def verification_details(record, record_path=None):
+def verification_details(record: JSON, record_path: str | None = None) -> JSON:
     return {"verification_record": record_path or f".harness/runs/{record['run_id']}.json",
             "check_diagnostics": [{key: r.get(key) for key in ("id", "status", "reason", "exit_code")}
                                   for r in record["results"]]}
 
 
-def red_details(record, expected, observed, record_path=None):
-    expected, observed = set(expected), set(observed)
-    return {**verification_details(record, record_path), "expected_red_check_ids": sorted(expected),
-            "observed_red_check_ids": sorted(observed), "missing_red_check_ids": sorted(expected - observed),
-            "unexpected_red_check_ids": sorted(observed - expected)}
+def red_details(record: JSON, expected: Iterable[str], observed: Iterable[str], record_path: str | None = None) -> JSON:
+    wanted, seen = set(expected), set(observed)
+    return {**verification_details(record, record_path), "expected_red_check_ids": sorted(wanted),
+            "observed_red_check_ids": sorted(seen), "missing_red_check_ids": sorted(wanted - seen),
+            "unexpected_red_check_ids": sorted(seen - wanted)}
 
 
-def write_diff(root, manifest, original, directory):
+def write_diff(root: Path, manifest: JSON, original: dict[str, bytes], directory: Path) -> tuple[list[str], str]:
     current = {p.relative_to(root).as_posix(): p.read_bytes() for p in input_files(root, manifest)}
     changed = sorted(name for name in original.keys() | current.keys() if original.get(name) != current.get(name))
-    parts = []
+    parts: list[str] = []
     for name in changed:
         try:
             before = original.get(name, b"").decode("utf-8").splitlines()
@@ -377,8 +399,9 @@ def write_diff(root, manifest, original, directory):
 
 
 @interrupt_on_term
-def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=300,
-              review_model=None, implement_model=None):
+def run_agent(root: Path, manifest: JSON, requirement: str | None = None, max_attempts: int = 3,
+              timeout_seconds: int = 300, review_model: str | None = None, implement_model: str | None = None,
+              python: str | None = None) -> JSON:
     require("agent" in manifest, "harness.json needs agent.code_paths and agent.test_paths")
     require(type(max_attempts) is int and max_attempts > 0, "max-attempts must be a positive integer")
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
@@ -391,31 +414,42 @@ def run_agent(root, manifest, requirement=None, max_attempts=3, timeout_seconds=
     require(implement_model is None or workflow == "claude" and is_text(implement_model),
             "--implement-model needs the claude workflow; Codex uses its own configured model")
     with project_lock(root, "agent"):
-        return develop(root, manifest, requirement, max_attempts, timeout_seconds, review_model, implement_model)
+        return develop(root, manifest, requirement, max_attempts, timeout_seconds, review_model, implement_model,
+                       python)
 
 
-def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_model=None, implement_model=None):
+def develop(root: Path, manifest: JSON, requirement: str | None, max_attempts: int, timeout_seconds: int,
+            review_model: str | None = None, implement_model: str | None = None, python: str | None = None) -> JSON:
     workflow = manifest["agent"].get("workflow", "codex")
     use_claude = workflow != "codex"
     implementer = "claude" if workflow == "claude" else "codex"
-    design, review = None, None
+    # The verifier runs on the harness interpreter; only {python} in checks uses the project's.
+    options = ["--python", python] if python else []
+    design: JSON | None = None
+    review: JSON | None = None
+    target: JSON = {}
+    scenarios: list[JSON] = []
+    checks: list[JSON] = []
+    check_ids: set[str] = set()
+    original: dict[str, bytes] = {}
     started = datetime.now(timezone.utc)
     session_id = started.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
     directory = root / ".harness" / "agent-runs" / session_id
     plain_path(directory)
     directory.mkdir(parents=True)
-    report = {"schema_version": 1, "command": "agent", "session_id": session_id,
+    report: JSON = {"schema_version": 1, "command": "agent", "session_id": session_id,
               "project_root": str(root), "record": (directory / "run.json").relative_to(root).as_posix(),
               "started_at": started.isoformat(), "status": "running", "requirement": requirement,
               "workflow": workflow, "implementer": implementer,
               "models": {"review": review_model, "implement": implement_model},
+              "interpreters": {"harness": sys.executable, "checks": python or sys.executable},
               "review_status": "unverified" if use_claude else "not_requested",
               "attempts": 0, "max_attempts": max_attempts, "project_status": "unverified", "phases": []}
 
-    def save():
+    def save() -> None:
         write_json(directory / "run.json", report)
 
-    def finish(status, reason, **details):
+    def finish(status: str, reason: str, **details: Any) -> JSON:
         if reason in ("no_progress", "attempt_limit", "review_rejected"):
             failed = [c["id"] for c in report.get("check_diagnostics", []) if c["status"] != "passed"]
             details.setdefault("message", f"Stopped: {reason}; failing checks: {failed}; review: {report['review_status']}. Inspect verification_record and phase evidence before restarting.")
@@ -423,8 +457,8 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
         save()
         return report
 
-    def verify(label, *arguments):
-        result = verification_cli(root, manifest, "run", *arguments)
+    def verify(label: str, *arguments: str) -> JSON:
+        result = verification_cli(root, manifest, *options, "run", *arguments)
         report["phases"].append({"phase": label, "run_id": result["run_id"], "status": result["status"]})
         report.update(verification_details(result))
         save()
@@ -432,7 +466,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
             raise AgentError("inputs_changed", "Inputs changed during verification.", status="needs_input")
         return result
 
-    def call_agent(phase, attempt, feedback, regressions):
+    def call_agent(phase: str, attempt: int, feedback: JSON, regressions: list[str]) -> tuple[JSON, list[str]]:
         context = {"phase": phase, "attempt": attempt, "requirement": target,
                    "scenarios": scenarios, "checks": checks, **manifest["agent"],
                    "design": design, "review": review, "regressions": regressions,
@@ -441,13 +475,13 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
                                 and (r["id"] in check_ids or r["id"] in regressions)]}
         call_directory = directory / ("tests" if phase == "tests" else f"implement-{attempt}")
         call_directory.mkdir()
+        invoke: Invoker
         if implementer == "claude":
-            from .claude import invoke_claude_writer as invoke
+            from .claude import invoke_claude_writer
+            invoke = partial(invoke_claude_writer, model=implement_model) if implement_model else invoke_claude_writer
         else:
             invoke = invoke_codex
-        if implement_model:
-            invoke = partial(invoke, model=implement_model)
-        event = {"phase": phase, "provider": implementer, "attempt": attempt, "status": "running"}
+        event: JSON = {"phase": phase, "provider": implementer, "attempt": attempt, "status": "running"}
         report["phases"].append(event)
         if use_claude and phase == "implement":
             report["review_status"] = "unverified"
@@ -468,7 +502,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
             raise AgentError("agent_question", response["summary"], status="needs_input", question=response["question"])
         return response, changed
 
-    def call_claude(phase, attempt, feedback):
+    def call_claude(phase: str, attempt: int, feedback: JSON) -> JSON:
         from .claude import invoke_claude, validate_design, validate_review
         expected = feedback["fingerprint_after"]
         if fingerprint(root, manifest) != expected:
@@ -484,13 +518,13 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
                    "verification_record": f".harness/runs/{feedback['run_id']}.json"}
         if phase == "review":
             context["changed_files"], context["diff_path"] = write_diff(root, manifest, original, call_directory)
-        event = {"phase": phase, "provider": "claude", "attempt": attempt, "status": "running",
+        event: JSON = {"phase": phase, "provider": "claude", "attempt": attempt, "status": "running",
                  "fingerprint": expected, "run_id": feedback["run_id"]}
         report["phases"].append(event)
         save()
         try:
             validate = validate_design if phase == "design" else validate_review
-            invoke = partial(invoke_claude, model=review_model) if review_model else invoke_claude
+            invoke: Invoker = partial(invoke_claude, model=review_model) if review_model else invoke_claude
             raw, changed, ignored = guarded_invoke(root, root, invoke, context, call_directory, timeout_seconds)
             response = validate(raw)
         except AgentError as error:
@@ -525,7 +559,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
         if implementer == "codex":
             providers.append("codex")
         require_providers(providers, claude_writer=implementer == "claude")
-        verification_cli(root, manifest, "check")
+        verification_cli(root, manifest, *options, "check")
         baseline = verify("baseline")
         state = current_state(manifest, baseline)
         report["project_status"] = state["status"]
@@ -562,7 +596,7 @@ def develop(root, manifest, requirement, max_attempts, timeout_seconds, review_m
                           message=f"Expected Red {response['red_check_ids']}; observed ordinary failures {sorted(failed)}. Inspect the checks and evidence before retrying.",
                           **red_details(feedback, response["red_check_ids"], failed))
         originally_passed = {r["id"] for r in baseline["results"] if r["status"] == "passed"}
-        regressions = []
+        regressions: list[str] = []
         for attempt in range(1, max_attempts + 1):
             report["attempts"] = attempt
             _, changed = call_agent("implement", attempt, feedback, regressions)

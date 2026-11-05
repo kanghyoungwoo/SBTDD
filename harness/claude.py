@@ -1,12 +1,14 @@
+from collections.abc import Callable, Sequence
 import json
 from pathlib import Path
 import shutil
+from typing import Any
 
 from .agent import AgentError, parse_with_repair, run_process, write_json
-from .core import HarnessError, fields, is_text, require
+from .core import JSON, HarnessError, fields, is_text, require
 
 
-DESIGN_SCHEMA = {
+DESIGN_SCHEMA: JSON = {
     "type": "object",
     "properties": {
         "outcome": {"type": "string", "enum": ["continue", "needs_input"]},
@@ -19,7 +21,7 @@ DESIGN_SCHEMA = {
     "additionalProperties": False,
 }
 
-REVIEW_SCHEMA = {
+REVIEW_SCHEMA: JSON = {
     "type": "object",
     "properties": {
         "verdict": {"type": "string", "enum": ["approved", "changes_requested", "needs_input"]},
@@ -68,7 +70,7 @@ outcome/verdict is needs_input. Every invocation starts fresh; do not rely on ea
 """
 
 
-def validate_design(value):
+def validate_design(value: Any) -> JSON:
     try:
         fields(value, set(DESIGN_SCHEMA["required"]), set(), "design response")
         require(value["outcome"] in ("continue", "needs_input"), "Unknown design outcome")
@@ -84,10 +86,11 @@ def validate_design(value):
             require(not value["question"].strip(), "Unexpected design question")
     except HarnessError as error:
         raise AgentError("invalid_response", str(error)) from error
-    return value
+    response: JSON = value
+    return response
 
 
-def validate_review(value):
+def validate_review(value: Any) -> JSON:
     try:
         fields(value, set(REVIEW_SCHEMA["required"]), set(), "review response")
         require(value["verdict"] in ("approved", "changes_requested", "needs_input"), "Unknown review verdict")
@@ -108,7 +111,8 @@ def validate_review(value):
                     "Review verdict contradicts findings")
     except HarnessError as error:
         raise AgentError("invalid_response", str(error)) from error
-    return value
+    response: JSON = value
+    return response
 
 
 READ_TOOLS = "Read,Glob,Grep"
@@ -121,14 +125,14 @@ any failures and review findings in the next attempt's context, so reason from t
 """
 
 
-def reader_command(executable, schema, tools, model=None):
+def reader_command(executable: str, schema: JSON, tools: str, model: str | None = None) -> list[str]:
     return [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
             "--safe-mode", "--tools", tools, "--allowedTools", tools,
             "--disallowedTools", "mcp__*", "--permission-mode", "dontAsk", "--no-session-persistence",
             *(["--model", model] if model else [])]
 
 
-def edit_rules(root, paths):
+def edit_rules(root: Path, paths: Sequence[str]) -> list[str]:
     """Edit rules (they also govern Write) anchored at the project root, which is the call's cwd."""
     rules = []
     for value in paths:
@@ -137,7 +141,7 @@ def edit_rules(root, paths):
     return rules
 
 
-def writer_command(executable, schema, rules, model=None):
+def writer_command(executable: str, schema: JSON, rules: list[str], model: str | None = None) -> list[str]:
     # --restricted drops every command-running tool and WebFetch, confines file tools to the working
     # directory and refuses bypassPermissions; dontAsk denies any edit the rules do not allow.
     return [executable, "--print", "--output-format", "json", "--json-schema", json.dumps(schema),
@@ -147,8 +151,8 @@ def writer_command(executable, schema, rules, model=None):
             *(["--model", model] if model else [])]
 
 
-def result_parser(validate):
-    def parse(text):
+def result_parser(validate: Callable[[Any], JSON]) -> Callable[[str], JSON]:
+    def parse(text: str) -> JSON:
         envelope = json.loads(text)
         if not isinstance(envelope, dict) or envelope.get("type") != "result":
             raise AgentError("invalid_response", "Claude did not return a result envelope.")
@@ -158,15 +162,17 @@ def result_parser(validate):
     return parse
 
 
-def claude_executable():
+def claude_executable() -> str:
     executable = shutil.which("claude")
     if executable is None:
         raise AgentError("agent_missing", "Claude CLI is not on PATH. Install it and run 'claude auth login'.")
     return executable
 
 
-def invoke_claude(root, context, directory, timeout, model=None):
+def invoke_claude(root: Path, context: JSON, directory: Path, timeout: int, model: str | None = None) -> JSON:
     executable = claude_executable()
+    schema: JSON
+    validate: Callable[[Any], JSON]
     if context["phase"] == "spec":
         from .spec import SPEC_INSTRUCTIONS, SPEC_SCHEMA, validate_spec
         schema, validate, instructions = SPEC_SCHEMA, validate_spec, SPEC_INSTRUCTIONS
@@ -179,7 +185,7 @@ def invoke_claude(root, context, directory, timeout, model=None):
     write_json(directory / "schema.json", schema)
     output = run_process(root, reader_command(executable, schema, READ_TOOLS, model), prompt, directory, timeout, "Claude")
 
-    def repair(prompt, folder):
+    def repair(prompt: str, folder: Path) -> str:
         return run_process(root, reader_command(executable, schema, "", model), prompt, folder, timeout,
                            "Claude response repair")
 
@@ -188,7 +194,7 @@ def invoke_claude(root, context, directory, timeout, model=None):
     return response
 
 
-def invoke_claude_writer(root, context, directory, timeout, model=None):
+def invoke_claude_writer(root: Path, context: JSON, directory: Path, timeout: int, model: str | None = None) -> JSON:
     """Claude in the Codex roles: write tests, scaffold or implementation within the phase's paths."""
     from .agent import INSTRUCTIONS as TASK_INSTRUCTIONS, RESPONSE_SCHEMA, SCAFFOLD_INSTRUCTIONS, validate_response
     executable = claude_executable()
@@ -201,7 +207,7 @@ def invoke_claude_writer(root, context, directory, timeout, model=None):
     command = writer_command(executable, RESPONSE_SCHEMA, edit_rules(root, paths), model)
     output = run_process(root, command, prompt, directory, timeout, "Claude")
 
-    def repair(prompt, folder):
+    def repair(prompt: str, folder: Path) -> str:
         return run_process(root, reader_command(executable, RESPONSE_SCHEMA, "", model), prompt, folder, timeout,
                            "Claude response repair")
 

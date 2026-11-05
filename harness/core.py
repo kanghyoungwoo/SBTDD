@@ -1,3 +1,4 @@
+from collections.abc import Collection
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -6,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import Any, TypeGuard
 import uuid
 
 from .guard import changed_paths, check_integrity, is_os_metadata, mark_integrity_violation, plain_path, tree_snapshot
@@ -16,41 +18,45 @@ from .processes import interrupt_on_term, run_command
 EXCLUDED = {".git", ".harness", ".venv", "__pycache__", ".pytest_cache"}
 STATES = ("failed", "stale", "unverified", "passed")
 
+# Contracts, records and AI responses are JSON objects; their shape is validated where they are read.
+JSON = dict[str, Any]
+
 
 class HarnessError(ValueError):
     pass
 
 
-def require(condition, message):
+def require(condition: object, message: str) -> None:
     if not condition:
         raise HarnessError(message)
 
 
-def fields(value, required, optional, label):
-    require(isinstance(value, dict), f"{label} must be an object")
+def fields(value: object, required: set[str], optional: set[str], label: str) -> None:
+    if not isinstance(value, dict):
+        raise HarnessError(f"{label} must be an object")
     require(required <= value.keys(), f"{label}: missing fields {sorted(required - value.keys())}")
     require(value.keys() <= required | optional,
             f"{label}: unknown fields {sorted(value.keys() - required - optional)}")
 
 
-def is_text(value):
+def is_text(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(value.strip()) and "\0" not in value
 
 
-def text_list(value, label):
+def text_list(value: object, label: str) -> None:
     require(isinstance(value, list) and bool(value) and all(is_text(v) for v in value),
             f"{label} must be a nonempty array of nonempty strings")
 
 
-def read_json(path):
+def read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, UnicodeError) as error:
         raise HarnessError(f"Invalid JSON in {path.name}: {error}") from error
 
 
-def load_manifest(root):
-    data = read_json(root / "harness.json")
+def load_manifest(root: Path) -> JSON:
+    data: JSON = read_json(root / "harness.json")
     fields(data, {"version", "inputs", "requirements", "scenarios", "checks"}, {"agent"}, "harness.json")
     require(type(data["version"]) is int and data["version"] == 1, "version must be 1")
     text_list(data["inputs"], "inputs")
@@ -59,8 +65,8 @@ def load_manifest(root):
         "scenarios": ({"id", "requirement", "given", "when", "then"}, set()),
         "checks": ({"id", "kind", "scenarios", "command"}, {"timeout_seconds"}),
     }
-    indexes = {}
-    all_ids = set()
+    indexes: dict[str, dict[str, JSON]] = {}
+    all_ids: set[str] = set()
     for name, (required, optional) in definitions.items():
         require(isinstance(data[name], list) and bool(data[name]), f"{name} must be a nonempty array")
         indexes[name] = {}
@@ -94,7 +100,7 @@ def load_manifest(root):
         require(settings.get("workflow", "codex") in ("codex", "claude-codex", "claude"),
                 "agent.workflow must be codex, claude-codex or claude")
         inputs = [root / value for value in data["inputs"]]
-        scopes = {}
+        scopes: dict[str, list[Path]] = {}
         for name in ("code_paths", "test_paths"):
             text_list(settings[name], f"agent.{name}")
             scopes[name] = []
@@ -117,14 +123,14 @@ def load_manifest(root):
     return data
 
 
-def input_files(root, manifest):
+def input_files(root: Path, manifest: JSON) -> list[Path]:
     files = {root / "harness.json"}
 
-    def validate_path(path):
+    def validate_path(path: Path) -> None:
         require(not path.is_symlink(), f"Input symlinks are unsupported: {path}")
         require(path.resolve().is_relative_to(root), f"Input outside project: {path}")
 
-    def walk_error(error):
+    def walk_error(error: OSError) -> None:
         raise error
 
     for value in manifest["inputs"]:
@@ -149,7 +155,7 @@ def input_files(root, manifest):
     return sorted(files, key=lambda p: p.relative_to(root).as_posix())
 
 
-def fingerprint(root, manifest):
+def fingerprint(root: Path, manifest: JSON) -> str:
     # Always rehashed from content: the fingerprint is the long-lived validity basis of results.
     digest = hashlib.sha256()
     for path in input_files(root, manifest):
@@ -159,13 +165,15 @@ def fingerprint(root, manifest):
     return digest.hexdigest()
 
 
-def aggregate(states):
+def aggregate(states: Collection[str]) -> str:
     return next(state for state in STATES if state in states)
 
 
-def execute_check(root, check):
-    command = [sys.executable if part == "{python}" else part for part in check["command"]]
-    result = {"id": check["id"], "command": command, "status": "failed", "exit_code": None,
+def execute_check(root: Path, check: JSON, python: str | None = None) -> JSON:
+    # {python} is the project's interpreter (--python); the harness itself may run elsewhere.
+    interpreter = python or sys.executable
+    command = [interpreter if part == "{python}" else part for part in check["command"]]
+    result: JSON = {"id": check["id"], "command": command, "status": "failed", "exit_code": None,
               "stdout": "", "stderr": "", "reason": "exit_code"}
     started = time.monotonic()
     try:
@@ -177,8 +185,8 @@ def execute_check(root, check):
         result.update(exit_code=process.returncode, stdout=process.stdout, stderr=process.stderr,
                       status="passed" if process.returncode == 0 else "failed")
     except subprocess.TimeoutExpired as error:
-        def decode(value):
-            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or ""
+        def decode(value: object) -> str:
+            return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
         result.update(reason="timeout", stdout=decode(error.stdout), stderr=decode(error.stderr))
     except OSError as error:
         result.update(reason="launch_error", stderr=str(error))
@@ -187,15 +195,17 @@ def execute_check(root, check):
 
 
 @interrupt_on_term
-def run_checks(root, manifest, before, requirement=None):
+def run_checks(root: Path, manifest: JSON, before: str, requirement: str | None = None,
+               python: str | None = None) -> JSON:
     if requirement is not None:
         require(any(r["id"] == requirement for r in manifest["requirements"]),
                 f"Unknown requirement: {requirement}")
     with project_lock(root, "run"):
-        return record_checks(root, manifest, before, requirement)
+        return record_checks(root, manifest, before, requirement, python)
 
 
-def record_checks(root, manifest, before, requirement):
+def record_checks(root: Path, manifest: JSON, before: str, requirement: str | None,
+                  python: str | None = None) -> JSON:
     try:
         check_integrity(root)
     except ValueError as error:
@@ -207,11 +217,11 @@ def record_checks(root, manifest, before, requirement):
     run_id = started.strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
     evidence = root / ".harness"
     evidence_before = tree_snapshot(evidence)
-    results = []
-    interrupted = None
+    results: list[JSON] = []
+    interrupted: str | None = None
     for index, check in enumerate(checks):
         try:
-            results.append(execute_check(root, check))
+            results.append(execute_check(root, check, python))
         except KeyboardInterrupt as error:
             interrupted = getattr(error, "signal_name", "SIGINT")
             for pending in checks[index:]:
@@ -223,18 +233,20 @@ def record_checks(root, manifest, before, requirement):
                         if not is_os_metadata(name)]
     if evidence_changes:
         mark_integrity_violation(evidence, evidence_changes)
-    snapshot_error = None
+    snapshot_error: str | None = None
+    after: str | None
     try:
         after = fingerprint(root, manifest)
     except (HarnessError, OSError) as error:
         after = None
         snapshot_error = str(error)
     stable = before == after and not interrupted and not evidence_changes
-    record = {
+    record: JSON = {
         "schema_version": 1, "command": "run", "run_id": run_id,
         "started_at": started.isoformat(), "finished_at": datetime.now(timezone.utc).isoformat(),
         "fingerprint": before, "fingerprint_after": after, "stable": stable,
         "status": aggregate([r["status"] for r in results]) if stable else "stale",
+        "interpreters": {"harness": sys.executable, "checks": python or sys.executable},
         "results": results,
     }
     if interrupted:
@@ -253,8 +265,8 @@ def record_checks(root, manifest, before, requirement):
     return record
 
 
-def read_record(path):
-    record = read_json(path)
+def read_record(path: Path) -> JSON:
+    record: JSON = read_json(path)
     require(isinstance(record, dict), f"Invalid run record: {path.name}")
     require(record.get("schema_version") == 1 and is_text(record.get("run_id"))
             and is_text(record.get("fingerprint")) and type(record.get("stable")) is bool
@@ -269,12 +281,12 @@ def read_record(path):
     return record
 
 
-def project_status(root, manifest, current):
+def project_status(root: Path, manifest: JSON, current: str) -> JSON:
     try:
         check_integrity(root)
     except ValueError as error:
         raise HarnessError(str(error)) from error
-    latest = {}
+    latest: dict[str, tuple[JSON, JSON]] = {}
     for path in sorted((root / ".harness" / "runs").glob("*.json")):
         record = read_record(path)
         for result in record["results"]:
@@ -282,10 +294,10 @@ def project_status(root, manifest, current):
     return status_from_latest(manifest, current, latest)
 
 
-def status_from_latest(manifest, current, latest):
+def status_from_latest(manifest: JSON, current: str | None, latest: dict[str, tuple[JSON, JSON]]) -> JSON:
     checks = []
     for check in manifest["checks"]:
-        item = {"id": check["id"], "kind": check["kind"], "status": "unverified",
+        item: JSON = {"id": check["id"], "kind": check["kind"], "status": "unverified",
                 "run_id": None, "last_result": None}
         if check["id"] in latest:
             record, result = latest[check["id"]]

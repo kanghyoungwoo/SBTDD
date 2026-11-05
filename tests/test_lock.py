@@ -149,7 +149,7 @@ class WindowsLockBranchTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         descriptor = os.open(Path(temporary.name) / "lock", os.O_RDWR | os.O_CREAT)
         self.addCleanup(os.close, descriptor)
-        with patch.object(lock.os, "name", "nt"):
+        with patch.object(lock.sys, "platform", "win32"):
             with patch.object(lock, "msvcrt", FakeMsvcrt(), create=True):
                 self.assertTrue(lock.try_lock(descriptor))
                 lock.unlock(descriptor)

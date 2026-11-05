@@ -1,20 +1,23 @@
+from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 import re
 import sys
+from typing import Any
 import uuid
 
-from .agent import (AgentError, guarded_invoke, ignored_details, invoke_codex, red_details, require_providers,
-                    validate_response, verification_cli, write_json)
+from .agent import (AgentError, Invoker, guarded_invoke, ignored_details, invoke_codex, red_details,
+                    require_providers, validate_response, verification_cli, write_json)
 from .guard import check_integrity, plain_path
 from .lock import project_lock
 from .processes import interrupt_on_term
 from .claude import invoke_claude, invoke_claude_writer
-from .core import HarnessError, fields, fingerprint, input_files, is_text, load_manifest, require
+from .core import JSON, HarnessError, fields, fingerprint, input_files, is_text, load_manifest, require
+from .runtime import harness_command
 
 
-SPEC_SCHEMA = {
+SPEC_SCHEMA: JSON = {
     "type": "object",
     "properties": {
         "outcome": {"type": "string", "enum": ["continue", "needs_input"]},
@@ -61,7 +64,7 @@ __pycache__/
 """
 
 
-def validate_spec(value):
+def validate_spec(value: Any) -> JSON:
     try:
         fields(value, set(SPEC_SCHEMA["required"]), set(), "spec response")
         require(value["outcome"] in ("continue", "needs_input"), "Unknown spec outcome")
@@ -84,10 +87,11 @@ def validate_spec(value):
             require(bool(value["requirements"]) and bool(value["scenarios"]), "Missing requirements or scenarios")
     except HarnessError as error:
         raise AgentError("invalid_response", str(error)) from error
-    return value
+    spec: JSON = value
+    return spec
 
 
-def make_manifest(spec, workflow="claude-codex"):
+def make_manifest(spec: JSON, workflow: str = "claude-codex") -> JSON:
     return {
         "version": 1, "inputs": ["BRIEF.md", "SPEC.md", "src", "tests"],
         "agent": {"workflow": workflow, "code_paths": ["src"], "test_paths": ["tests"]},
@@ -99,7 +103,7 @@ def make_manifest(spec, workflow="claude-codex"):
     }
 
 
-def render_spec(spec):
+def render_spec(spec: JSON) -> str:
     lines = [f"# {spec['title']}", "", "원본 요구: BRIEF.md", "", "## 설계", "", spec["design"], "", "## 요구사항", ""]
     for requirement in spec["requirements"]:
         lines.extend([f"### {requirement['id']}", "", requirement["description"], ""])
@@ -110,11 +114,11 @@ def render_spec(spec):
     return "\n".join(lines)
 
 
-def stub_red_problem(root, result):
+def stub_red_problem(root: Path, result: JSON) -> str | None:
     """Return None for a valid source-stub Red, otherwise why the check does not qualify."""
     if result["reason"] != "exit_code":
-        return result["reason"]
-    output = result["stderr"]
+        return str(result["reason"])
+    output: str = result["stderr"]
     if "Failed to import test module" in output or "unittest.loader._FailedTest" in output:
         return "import_error"
     ran = re.search(r"\bRan (\d+) tests?\b", output)
@@ -143,7 +147,8 @@ def stub_red_problem(root, result):
 
 
 @interrupt_on_term
-def run_init(root, brief_path, timeout_seconds=300, implementer="codex", review_model=None, implement_model=None):
+def run_init(root: Path, brief_path: Path, timeout_seconds: int = 300, implementer: str = "codex",
+             review_model: str | None = None, implement_model: str | None = None, python: str | None = None) -> JSON:
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
     require(implementer in ("codex", "claude"), "implementer must be codex or claude")
     require(review_model is None or is_text(review_model), "--review-model must be a model name")
@@ -165,17 +170,19 @@ def run_init(root, brief_path, timeout_seconds=300, implementer="codex", review_
     # Refuse a non-empty target before the lock creates .harness inside it.
     require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
     with project_lock(root, "init"):
-        return initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implementer, review_model, implement_model)
+        return initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implementer, review_model, implement_model,
+                          python)
 
 
-def empty_project(root, brief_path):
+def empty_project(root: Path, brief_path: Path) -> bool:
     return all(path.name == ".harness" and path.is_dir() and not path.is_symlink()
                or path == brief_path and path.is_file() and not path.is_symlink()
                for path in root.iterdir())
 
 
-def initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implementer="codex",
-               review_model=None, implement_model=None):
+def initialize(root: Path, brief_path: Path, brief_bytes: bytes, brief: str, timeout_seconds: int,
+               implementer: str = "codex", review_model: str | None = None, implement_model: str | None = None,
+               python: str | None = None) -> JSON:
     check_integrity(root)
     require(empty_project(root, brief_path), "init requires an empty project (the brief and .harness history may exist)")
     started = datetime.now(timezone.utc)
@@ -185,30 +192,35 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implemente
     plain_path(draft)
     draft.mkdir(parents=True)
     (draft / "BRIEF.md").write_bytes(brief_bytes)
-    report = {"schema_version": 1, "command": "init", "session_id": session_id,
+    report: JSON = {"schema_version": 1, "command": "init", "session_id": session_id,
               "project_root": str(root), "record": (directory / "run.json").relative_to(root).as_posix(),
               "draft": draft.relative_to(root).as_posix(), "brief_source": str(brief_path),
               "started_at": started.isoformat(), "status": "running", "implementer": implementer,
-              "models": {"review": review_model, "implement": implement_model}, "phases": []}
-    designer = partial(invoke_claude, model=review_model) if review_model else invoke_claude
-    builder = invoke_claude_writer if implementer == "claude" else invoke_codex
-    if implement_model:
-        builder = partial(builder, model=implement_model)
+              "models": {"review": review_model, "implement": implement_model},
+              "interpreters": {"harness": sys.executable, "checks": python or sys.executable}, "phases": []}
+    designer: Invoker = partial(invoke_claude, model=review_model) if review_model else invoke_claude
+    builder: Invoker
+    if implementer == "claude":
+        builder = partial(invoke_claude_writer, model=implement_model) if implement_model else invoke_claude_writer
+    else:
+        builder = invoke_codex
     model_options = [*(["--review-model", review_model] if review_model else []),
                      *(["--implement-model", implement_model] if implement_model else [])]
+    # Global options precede the command, for the verifier and the next_command alike.
+    options = ["--python", python] if python else []
 
-    def save():
+    def save() -> None:
         write_json(directory / "run.json", report)
 
-    def finish(status, reason, **details):
+    def finish(status: str, reason: str, **details: Any) -> JSON:
         report.update(status=status, reason=reason, finished_at=datetime.now(timezone.utc).isoformat(), **details)
         save()
         return report
 
-    def call(phase, provider, context, invoke, validate):
+    def call(phase: str, provider: str, context: JSON, invoke: Invoker, validate: Callable[[Any], JSON]) -> JSON:
         folder = directory / phase
         folder.mkdir()
-        event = {"phase": phase, "provider": provider, "status": "running"}
+        event: JSON = {"phase": phase, "provider": provider, "status": "running"}
         report["phases"].append(event)
         save()
         try:
@@ -238,14 +250,14 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implemente
         (draft / "SPEC.md").write_text(render_spec(spec), encoding="utf-8")
         write_json(draft / "harness.json", make_manifest(spec, "claude" if implementer == "claude" else "claude-codex"))
         manifest = load_manifest(draft)
-        verification_cli(draft, manifest, "check")
+        verification_cli(draft, manifest, *options, "check")
         context = {"phase": "scaffold", "contract": manifest, "design": spec["design"],
                    "test_files": [{"scenario": check["scenarios"][0], "check": check["id"],
                                    "path": "tests/" + check["command"][-1]} for check in manifest["checks"]]}
         response = call("scaffold", implementer, context, builder, validate_response)
         if response["outcome"] == "needs_input":
             return finish("needs_input", "agent_question", question=response["question"], message=response["summary"])
-        red = verification_cli(draft, manifest, "run")
+        red = verification_cli(draft, manifest, *options, "run")
         report["phases"].append({"phase": "red", "run_id": red["run_id"], "status": red["status"]})
         if not red["stable"]:
             return finish("needs_input", "inputs_changed", message="Inputs changed while checking the scaffold.")
@@ -287,7 +299,7 @@ def initialize(root, brief_path, brief_bytes, brief, timeout_seconds, implemente
         write_json(runs / f"{red['run_id']}.json", red)
         return finish("ready", "scaffold_verified", artifacts=artifacts, fingerprint=current,
                       red_check_ids=sorted(check_ids), requirements=[r["id"] for r in manifest["requirements"]],
-                      next_command=[sys.executable, "-B", "-m", "harness", "--root", str(root), "agent",
+                      next_command=[*harness_command(), "--root", str(root), *options, "agent",
                                     "--requirement", manifest["requirements"][0]["id"], *model_options])
     except AgentError as error:
         return finish(error.status, error.reason, message=str(error), **error.details)

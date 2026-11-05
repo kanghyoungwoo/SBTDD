@@ -1,31 +1,47 @@
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import wraps
 import os
 import signal
 import subprocess
+import sys
 import threading
+from types import FrameType
+from typing import Any, NoReturn, ParamSpec, TypeVar
+
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+# Creation flags: no console window for helper processes, and a new process group so a whole tree
+# can be stopped. They exist only on Windows; elsewhere new sessions do the same job.
+if sys.platform == 'win32':
+    NO_WINDOW = subprocess.CREATE_NO_WINDOW
+    NEW_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+else:
+    NO_WINDOW = NEW_GROUP = 0
 
 
 class TerminationRequested(KeyboardInterrupt):
     signal_name = 'SIGTERM'
 
 
-def interrupt_on_term(function):
+def interrupt_on_term(function: Callable[P, R]) -> Callable[P, R]:
     @wraps(function)
-    def wrapped(*args, **kwargs):
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         with termination_handler():
             return function(*args, **kwargs)
     return wrapped
 
 
 @contextmanager
-def termination_handler():
+def termination_handler() -> Iterator[None]:
     if threading.current_thread() is not threading.main_thread():
         yield
         return
     previous = signal.getsignal(signal.SIGTERM)
 
-    def stop(signum, frame):
+    def stop(signum: int, frame: FrameType | None) -> NoReturn:
         raise TerminationRequested()
 
     signal.signal(signal.SIGTERM, stop)
@@ -35,11 +51,11 @@ def termination_handler():
         signal.signal(signal.SIGTERM, previous)
 
 
-def terminate_tree(process):
-    if os.name == 'nt':
+def terminate_tree(process: 'subprocess.Popen[Any]') -> None:
+    if sys.platform == 'win32':
         try:
             subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                           capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+                           capture_output=True, timeout=10, creationflags=NO_WINDOW)
         except (OSError, subprocess.TimeoutExpired):
             pass
         finally:
@@ -58,12 +74,10 @@ def terminate_tree(process):
             pass
 
 
-def run_command(command, *, timeout, **kwargs):
-    process = subprocess.Popen(
+def run_command(command: list[str], *, timeout: float, **kwargs: Any) -> 'subprocess.CompletedProcess[Any]':
+    process: subprocess.Popen[Any] = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=os.name != 'nt',
-        creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0,
-        **kwargs,
+        start_new_session=sys.platform != 'win32', creationflags=NEW_GROUP, **kwargs,
     )
     try:
         output, errors = process.communicate(timeout=timeout)

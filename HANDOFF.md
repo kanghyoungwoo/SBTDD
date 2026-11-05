@@ -17,7 +17,11 @@ cd SBTDD && git checkout claude/sharp-pasteur-u1adyq
 
 ## 2. 개발 환경
 
-- Python 3.11 이상. 표준 라이브러리만 쓰므로 `pip install`이 필요 없다.
+- Python 3.11 이상. 하네스 실행에는 표준 라이브러리만 쓰므로 `pip install`이 필요 없다.
+- 다른 폴더에서 하네스를 쓰려면 프로젝트와 분리된 환경에 설치한다: `pipx install .` 또는 `uv tool install .`,
+  또는 `python3 -B tools/build_zipapp.py`로 만든 `dist/harness.pyz`. 프로젝트에 `.venv`가 있으면 `--python`으로
+  그 인터프리터를 넘긴다(아래 3.1).
+- 타입 검사(개발 전용): `uv run --only-group dev mypy` 또는 `python3 -m pip install mypy==2.3.1 && python3 -m mypy`.
 - 하네스의 `agent` 명령은 Claude Code CLI 2.1.248 이상이 필요하다. 로그인은 직접 한다.
 - 개발 PC: ThinkPad(x86-64, Ubuntu). 실험·운영 PC: i7-7700 데스크톱(Linux). GPU는 빼고 RAM은 32GB를 권장한다.
 
@@ -26,7 +30,12 @@ cd SBTDD && git checkout claude/sharp-pasteur-u1adyq
 ```bash
 python3 -B -m unittest discover -s tests
 ```
-→ 하네스 테스트 157개 통과(skip 1).
+→ 하네스 테스트 167개 통과(skip 1).
+
+```bash
+python3 -B -m harness run
+```
+→ 하네스 자기 계약 13개 요구사항, 13개 체크 `passed`.
 
 ```bash
 python3 -B -m harness --root "$PWD/projects/qqq-accumulator" doctor
@@ -53,8 +62,18 @@ python3 -B -m harness --root "$PWD/projects/qqq-accumulator" run
   `--review-model`과 `--implement-model`로 구현 모델과 리뷰 모델을 분리한다.
 - OS 잠금(`harness/lock.py`)을 추가했다. 두 번째 실행은 `project_locked`로 거부한다.
 - provider 사전 점검을 추가했다. 조건에 따라 `agent_missing`, `agent_outdated`를 낸다.
-- 문서: `SPEC.md` v0.5, `README.md`, `.claude/skills/harness-workflow/SKILL.md`.
-- 구현 언어는 Python을 그대로 쓰기로 했다(측정 근거는 이전 대화에서 다뤘다).
+- 문서: `SPEC.md` v0.6, `README.md`, `.claude/skills/harness-workflow/SKILL.md`.
+- 구현 언어는 Python을 그대로 쓰기로 했다(측정 근거는 이전 대화에서 다뤘다). 백지에서 다시 비교해도
+  Python이 근소하게 1위였고, 그때 짚은 약점 세 가지를 v0.6에서 보완했다.
+  1. 실행 환경 분리(REQ-RUNTIME): `--python PYTHON`이 검사의 `{python}`만 프로젝트 인터프리터로 바꾼다.
+     가상환경 심볼릭 링크는 풀지 않는다. agent·init이 쓰는 검증기는 `-I -S`로 실행해 `.pth`·sitecustomize가
+     검증 결과를 위조하지 못한다(`-S`를 빼면 위조되는 것을 테스트로 확인). doctor에 `isolation`,
+     `project.python` 항목을 추가했고, 실행 기록에 `interpreters`를 남긴다.
+  2. 설치·배포(REQ-DIST): pipx/uv tool 설치를 확인했고(Python 3.11 도구 환경 포함), 표준 라이브러리로
+     만드는 재현 가능한 단일 파일 `harness.pyz`(`tools/build_zipapp.py`)를 추가했다.
+  3. 정적 타입: `harness/`와 `tools/` 전체에 타입 힌트를 달고 mypy `--strict`가 Linux·Windows·macOS
+     분기에서 모두 통과한다(pyright도 0건). mypy가 없는 PC에서도 `run`이 통과하도록 `harness.json` 검사에는
+     넣지 않고, GitHub Actions(`.github/workflows/ci.yml`)가 3개 OS × Python 3.11·3.13 테스트와 타입 검사를 돌린다.
 
 ### 3.2 QQQ 장기 적립 프로그램 (`projects/qqq-accumulator/`)
 

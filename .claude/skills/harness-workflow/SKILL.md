@@ -14,6 +14,10 @@ work the user already requested. A request for explanation alone does not author
 
 Run commands from the Harness checkout containing `harness/__main__.py` (three directories
 above this skill), with an absolute target path after `--root` and before the subcommand.
+An installed `harness` command or `python -I -S dist/harness.pyz` takes the same arguments.
+If the target project has its own virtual environment, also pass its interpreter with
+`--python` before the subcommand, so checks run there while the harness keeps its own interpreter.
+Do not install the harness into the target project's environment; `doctor` reports that as `isolation`.
 Read the relevant command section in [README.md](../../../README.md) when needed.
 
 ## New project

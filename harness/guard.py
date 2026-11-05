@@ -1,8 +1,10 @@
 """Change detection; this is not an operating-system sandbox."""
 
+from collections.abc import Iterable, Mapping
 import hashlib
 import json
 import os
+from pathlib import Path
 import stat
 import time
 
@@ -12,18 +14,18 @@ REPARSE_POINT = 0x400
 # Coarse file systems (FAT) store 2-second timestamps: a file written that recently could change
 # again without a visible timestamp change, so its digest is never reused.
 SETTLE_NS = 2_000_000_000
-_digests = {}
+_digests: dict[str, tuple[tuple[int, ...], str]] = {}
 
 
-def is_link(path):
+def is_link(path: Path) -> bool:
     return is_link_info(path.lstat())
 
 
-def is_link_info(info):
+def is_link_info(info: os.stat_result) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & REPARSE_POINT)
 
 
-def signature(info):
+def signature(info: os.stat_result) -> tuple[int, ...]:
     """What must stay equal for a cached digest to be reused.
 
     POSIX ctime changes on every write or timestamp change and user code cannot set it back.
@@ -34,7 +36,7 @@ def signature(info):
     return info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino, info.st_dev
 
 
-def file_digest(path, info):
+def file_digest(path: str, info: os.stat_result) -> str:
     key = os.fspath(path)
     mark = signature(info)
     known = _digests.get(key)
@@ -50,19 +52,19 @@ def file_digest(path, info):
     return value
 
 
-def plain_path(path):
+def plain_path(path: Path) -> None:
     for item in [*reversed(path.parents), path]:
         if (item.exists() or item.is_symlink()) and is_link(item):
             raise OSError(f'Refusing to write through a symlink or reparse point: {item}')
 
 
-def tree_snapshot(root, excluded=()):
+def tree_snapshot(root: Path, excluded: Iterable[Path] = ()) -> dict[str, str]:
     """Map each path to 'directory', 'link:<target>' or the SHA-256 of its content.
 
     Files are hashed in a stream. A digest is reused only within this process and only while the
     file's signature is unchanged and older than SETTLE_NS.
     """
-    result = {}
+    result: dict[str, str] = {}
     base = os.fspath(root)
     # normcase keeps Windows' case-insensitive path equality, as pathlib comparisons had.
     skip = {os.path.normcase(os.fspath(path)) for path in excluded}
@@ -88,7 +90,7 @@ def tree_snapshot(root, excluded=()):
     return result
 
 
-def changed_paths(before, after):
+def changed_paths(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
     return sorted(name for name in before.keys() | after.keys() if before.get(name) != after.get(name))
 
 
@@ -99,11 +101,11 @@ OS_METADATA = {'.DS_Store', 'Thumbs.db', 'desktop.ini'}
 TOOL_CACHES = {'.pytest_cache', '.mypy_cache', '.ruff_cache', '.hypothesis'}
 
 
-def is_os_metadata(name):
+def is_os_metadata(name: str) -> bool:
     return name.rsplit('/', 1)[-1] in OS_METADATA
 
 
-def is_benign_change(name):
+def is_benign_change(name: str) -> bool:
     parts = name.split('/')
     last = parts[-1]
     if last in OS_METADATA or last == '.coverage' or last.startswith('.coverage.'):
@@ -119,7 +121,7 @@ def is_benign_change(name):
     return False
 
 
-def mark_integrity_violation(evidence, changed):
+def mark_integrity_violation(evidence: Path, changed: list[str]) -> None:
     path = evidence / INTEGRITY_MARKER
     plain_path(path)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -127,7 +129,7 @@ def mark_integrity_violation(evidence, changed):
                     encoding='utf-8')
 
 
-def check_integrity(root):
+def check_integrity(root: Path) -> None:
     path = root / '.harness' / INTEGRITY_MARKER
     plain_path(path)
     if path.exists():

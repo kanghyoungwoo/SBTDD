@@ -1,4 +1,4 @@
-# SDD · BDD · TDD Harness 명세 v0.5
+# SDD · BDD · TDD Harness 명세 v0.6
 
 ## 목적과 범위
 
@@ -6,7 +6,8 @@
 개발자와 AI 실행기는 같은 CLI와 JSON 결과를 사용한다.
 이번 버전은 로컬 단일 실행과 Claude 설계·검토, Codex 또는 Claude 구현을 통한 요구사항 하나의 개발 루프를 대상으로 한다.
 
-Python 3.11 이상과 표준 라이브러리로 구현한다. 프로젝트별 계약은
+Python 3.11 이상과 표준 라이브러리로 구현한다. Harness는 자기 인터프리터에서 실행하고, 검사 명령은
+`--python`으로 지정한 프로젝트 인터프리터로 실행할 수 있다(실행 환경과 배포 절). 프로젝트별 계약은
 `harness.json`에 저장한다. 기존 명세를 기준으로 Claude가 구현 계획과 결과를 검토한다.
 요구사항 결정은 사용자에게 있으며, CLI는 구조와 명시적으로 등록한 검사 결과를 검증한다.
 빈 Python 프로젝트는 자연어 요구사항에서 명세·BDD와 API·테스트 뼈대를 생성해 같은 개발 루프에 연결한다.
@@ -40,15 +41,20 @@ Given/When/Then의 원본은 JSON이다. 별도 Gherkin 사본이나 파서를 �
 | REQ-RECOVERY | 잘못된 AI 응답은 읽기 전용 형식 보정을 한 번만 시도하고, 중단 신호와 시간 초과에서는 자식 프로세스를 정리하고 중단을 기록한다. |
 | REQ-PREFLIGHT | 모델을 호출하지 않고 로컬 CLI·로그인·프로젝트를 점검하며, 필요한 AI CLI가 없으면 검사와 모델 호출 전에 중단한다. |
 | REQ-LOCK | 실행 기록을 쓰는 명령은 프로젝트마다 한 번에 하나만 실행하고, 기다리지 않고 거절된 명령은 증거를 바꾸지 않는다. |
+| REQ-RUNTIME | Harness와 검증기는 Harness의 인터프리터에서, 검사의 `{python}`은 `--python`으로 지정한 프로젝트 인터프리터에서 실행한다. 검증기는 사이트 훅을 실행하지 않고, doctor는 섞인 구성을 알린다. |
+| REQ-DIST | 분리된 도구 환경(pipx, uv tool) 설치와 표준 라이브러리로 만든 단일 파일 `harness.pyz` 실행을 지원하며, 같은 소스는 같은 바이트의 `harness.pyz`를 만든다. |
 
 ## CLI 계약
 
 ```text
-python -m harness [--root PROJECT] check
-python -m harness [--root PROJECT] run [--requirement ID]
-python -m harness [--root PROJECT] status
-python -m harness [--root PROJECT] doctor [--provider all|codex|claude]
+python -m harness [--root PROJECT] [--python PYTHON] check
+python -m harness [--root PROJECT] [--python PYTHON] run [--requirement ID]
+python -m harness [--root PROJECT] [--python PYTHON] status
+python -m harness [--root PROJECT] [--python PYTHON] doctor [--provider all|codex|claude]
 ```
+
+`python -m harness` 대신 설치한 `harness` 명령이나 `python harness.pyz`를 써도 같다. `--root`와 `--python`은
+명령 이름 앞에 둔다.
 
 각 명령은 표준 출력으로 JSON 객체 하나를 출력한다. 스키마 버전은 1이다.
 
@@ -61,8 +67,9 @@ python -m harness [--root PROJECT] doctor [--provider all|codex|claude]
 - 종료 코드: 0 = 구조 검사 성공, 대상 검사 전체 통과 또는 ready,
   1 = 실패·미검증·오래된 결과·확인 필요, 2 = 계약·기록·입출력·잠금 오류.
 
-명령은 문자열 배열이며 셸 문법을 해석하지 않는다. `{python}` 토큰은 현재
-Python 실행 파일로 치환한다. 검사별 `timeout_seconds`는 양의 정수이고 기본 30초다.
+명령은 문자열 배열이며 셸 문법을 해석하지 않는다. 배열 원소가 정확히 `{python}`이면 `--python`으로
+지정한 인터프리터로, 지정하지 않으면 Harness를 실행한 Python으로 치환한다. 다른 자리표시자는 없으며,
+Python이 아닌 프로젝트는 `["npm", "test"]`처럼 도구를 직접 적는다. 검사별 `timeout_seconds`는 양의 정수이고 기본 30초다.
 종료 코드 0은 passed, 그 외 종료 코드·실행 실패·시간 초과는 failed다.
 명령과 그 하위 프로그램은 사용자 코드이므로 신뢰할 수 있는 프로젝트에서 실행한다.
 
@@ -131,8 +138,10 @@ ctime은 사용자 프로세스가 되돌릴 수 없으므로 수정 시각을 �
 사용하지 않고 오류로 끝난다. 사람이 영향받은 기록을 검토·복구 또는 격리한 뒤 표시를 지운다.
 AI 호출의 프롬프트·스키마·로그·응답은 프로젝트 밖 임시 폴더에서 받아 Harness가 증거 폴더로 복사한다.
 
-실행기가 호출하는 검증 CLI는 Harness 설치 위치에서 Python `-I` 격리 모드로 실행한다. 따라서
-프로젝트의 `harness.py`, `sitecustomize.py`, PYTHONPATH가 검증기를 대체하지 못한다.
+실행기가 호출하는 검증 CLI는 Harness 설치 위치(디렉터리 또는 `harness.pyz`)에서 Python `-I -S`로 실행한다.
+`-I`는 PYTHONPATH, 사용자 site-packages, 작업 디렉터리를 무시하므로 프로젝트의 `harness.py`,
+`sitecustomize.py`가 검증기를 대체하지 못한다. `-S`는 site 모듈을 건너뛰므로 Harness를 실행한 환경의
+`.pth` 파일과 sitecustomize도 검증기 안에서 실행되지 않는다. 검증기는 표준 라이브러리와 명시한 패키지 경로만 쓴다.
 이 감지는 호출 전후 비교이며 OS 보안 격리나 암호학적 증거 인증이 아니다. 호출 중 변경 후
 복원된 내용과, 호출이 끝난 뒤에도 남은 프로세스가 쓰는 내용은 보장하지 않는다.
 
@@ -152,9 +161,15 @@ agent와 init이 호출하는 검증 CLI는 보유자가 넘긴 일회용 토큰
 ## 사전 점검
 
 `doctor`는 Python 버전, 프로젝트 접근, 증거 무결성 표시, 존재하는 계약, Codex·Claude CLI의
-경로·버전·로그인 상태를 확인한다. `--provider`로 한 CLI만 확인할 수 있다. 모델 호출, 로그인,
-사용량 확인은 하지 않으며 인증 명령의 출력 원문을 결과에 넣지 않는다. 모든 항목이 통과하면 ready,
-아니면 항목별 reason과 action을 포함한 needs_input이다.
+경로·버전·로그인 상태를 확인한다. 실행 환경 항목은 다음과 같다.
+
+- `isolation`: Harness 인터프리터의 환경(`sys.prefix` 또는 실행 파일 폴더)이 프로젝트 안에 있으면
+  `inside_project`로 실패한다. 그 환경의 사이트 훅은 Harness 바깥 프로세스 안에서 실행되기 때문이다.
+- `project.python`: `--python`을 주면 그 인터프리터를 `-I`로 실행해 버전을 보고한다. 주지 않았는데
+  프로젝트에 `.venv`가 있고 Harness 인터프리터와 다르면 `project_venv_not_selected`로 실패하고 `--python`을 안내한다.
+
+`--provider`로 한 CLI만 확인할 수 있다. 모델 호출, 로그인, 사용량 확인은 하지 않으며 인증 명령의 출력
+원문을 결과에 넣지 않는다. 모든 항목이 통과하면 ready, 아니면 항목별 reason과 action을 포함한 needs_input이다.
 
 agent와 init은 시작할 때 workflow에 필요한 CLI가 PATH에 있는지 먼저 확인한다. codex 흐름은 Codex,
 claude-codex 흐름과 기본 init은 Claude와 Codex, claude 흐름과 `init --implementer claude`는 Claude만
@@ -162,6 +177,26 @@ claude-codex 흐름과 기본 init은 Claude와 Codex, claude 흐름과 `init --
 Claude가 구현을 맡으면 `--restricted`를 지원하는 Claude Code 2.1.248 이상이어야 한다. 버전이 낮으면
 같은 시점에 `agent_outdated`로 끝나고, 버전을 읽을 수 없으면 막지 않는다. doctor는 계약의 workflow가
 claude일 때 `claude.writer` 항목으로 이 버전을 확인한다.
+
+## 실행 환경과 배포
+
+Harness 자신은 표준 라이브러리만 쓰므로 프로젝트와 분리된 인터프리터에서 실행한다. 권장 구성은 다음과 같다.
+
+- 도구 환경 설치: 저장소에서 `pipx install .` 또는 `uv tool install .`. 전용 가상환경에 `harness` 명령이 생긴다.
+- 단일 파일: `python -B tools/build_zipapp.py`가 `dist/harness.pyz`를 만든다. 아카이브에는 `__main__.py`와
+  `harness/*.py`만 들어가고 항목 순서·시각·권한이 고정되어, 같은 소스는 같은 바이트(같은 SHA-256)를 만든다.
+  `python3 -I -S dist/harness.pyz ...`로 실행하면 바깥 프로세스도 사이트 훅 없이 실행된다.
+- 저장소 checkout에서 `python -B -m harness`로 실행해도 된다.
+
+`--python PYTHON`은 검사 명령의 `{python}`만 바꾼다. 경로 구분자가 없고 그런 파일도 없으면 PATH에서 찾고,
+상대 경로는 현재 작업 디렉터리 기준이다. 가상환경 인터프리터는 대개 기본 인터프리터로 가는 심볼릭 링크이므로
+링크를 풀지 않은 절대 경로를 쓴다. 실행 파일이 아니면 검사를 실행하지 않고 오류(종료 코드 2)로 끝난다.
+agent와 init은 같은 값을 검증 CLI에 넘기고, init의 next_command도 `agent` 앞에 같은 `--python`을 붙인다.
+실행 기록, agent·init의 run.json은 `interpreters`(`harness`, `checks`)에 두 인터프리터를 기록한다.
+
+`-S` 격리는 검증 CLI에만 적용된다. 사용자가 시작한 바깥 프로세스는 이미 그 환경의 사이트 훅을 실행한
+뒤이므로, 프로젝트 안의 가상환경에서 Harness를 실행하는 구성은 doctor의 `isolation`으로 알린다.
+검사 명령은 프로젝트 코드를 실행하므로 `--python`의 환경에서 평소처럼 사이트 훅을 실행한다.
 
 ## 신규 프로젝트 초기화 계약
 
@@ -345,10 +380,15 @@ CLI를 외부 프로세스로 호출하는 인수 테스트로 정상·누락·�
 Codex와 Claude(읽기 전용·구현) 어댑터는 인자·표준 입력·구조화된 응답·오류 처리를 검증하고,
 역할별 실행 순서, 거절 후 재검증, 질문·보호 파일·입력 변경 중단을 검증한다.
 변경 감지·증거 보호, 형식 보정·중단, 사전 점검은 `tests/test_hardening.py`, 잠금은
-`tests/test_lock.py`가 검증한다. 저장소의 모든 테스트는 `harness.json`의 검사 하나 이상에
+`tests/test_lock.py`, 실행 환경 분리와 단일 파일 배포는 `tests/test_runtime.py`가 검증한다. 저장소의 모든 테스트는 `harness.json`의 검사 하나 이상에
 연결되어야 하며, 연결되지 않은 테스트가 있으면 REQ-LINK 검사가 실패한다.
 별도 재고 예제에서 실제 Claude 설계·검토와 Codex 또는 Claude 구현 연결을 확인한다(`--implementer claude`).
 외부 모델을 사용하는 검사는 기본 테스트 실행에 포함하지 않는다.
 
-기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.5 범위에 포함하지 않는다.
+정적 타입 검사는 개발 단계에서만 한다. `harness`와 `tools`는 mypy `--strict`(pyproject.toml의 `[tool.mypy]`,
+버전은 `[dependency-groups] dev`에 고정)를 Linux·Windows·macOS 분기 각각에서 통과해야 한다. mypy가 없는
+환경에서도 하네스 검사가 통과하도록 `harness.json`의 검사에는 넣지 않는다. GitHub Actions(`.github/workflows/ci.yml`)가
+Ubuntu·Windows·macOS와 Python 3.11·3.13에서 테스트와 자기 계약 실행을, Ubuntu에서 타입 검사를 실행한다.
+
+기존 프로젝트의 명세 병합, 다른 언어의 초기 템플릿, 세션 재개, 변경 파일별 영향 분석은 v0.6 범위에 포함하지 않는다.
 SIGHUP 처리, Windows 프로세스의 단계적 종료, 잠금 대기도 이번 범위가 아니다.

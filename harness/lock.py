@@ -4,18 +4,22 @@ The lock is an operating-system file lock, so it disappears when its holder exit
 including SIGKILL. It coordinates honest harness processes; it is not a security boundary.
 """
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import errno
 import hashlib
 import json
 import os
+from pathlib import Path
 import secrets
+import sys
 import time
+from typing import Any
 
 from .guard import plain_path
 
-if os.name == "nt":
+if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
@@ -27,11 +31,11 @@ OWNER_FILE = "lock-owner.json"
 # Windows byte-range locks are mandatory: reads that overlap them fail even through another handle
 # of the holder. Lock one byte far past the empty file's content so evidence snapshots can read it.
 WINDOWS_LOCK_OFFSET = 1 << 30
-_held = {}
+_held: dict[Path, str] = {}
 
 
 class ProjectLocked(ValueError):
-    def __init__(self, root, owner):
+    def __init__(self, root: Path, owner: dict[str, Any]) -> None:
         self.owner = owner
         holder = (f"{owner.get('command', 'a command')} (pid {owner.get('pid', '?')}, "
                   f"since {owner.get('started_at', '?')})" if owner else "an unknown command")
@@ -39,23 +43,23 @@ class ProjectLocked(ValueError):
                          "the lock is released automatically when that process exits.")
 
 
-def environment(**overrides):
+def environment(**overrides: str) -> dict[str, str]:
     """Child environment without the lock token, so AI tools and checks cannot borrow the lock."""
     values = {key: value for key, value in os.environ.items() if key != TOKEN_VARIABLE}
     values.update(overrides)
     return values
 
 
-def held_token(root):
+def held_token(root: Path) -> str | None:
     return _held.get(root.resolve())
 
 
-def digest(token):
+def digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def try_lock(descriptor):
-    if os.name == "nt":
+def try_lock(descriptor: int) -> bool:
+    if sys.platform == "win32":
         os.lseek(descriptor, WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         try:
             msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
@@ -64,22 +68,23 @@ def try_lock(descriptor):
                 return False
             raise
         return True
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    return True
+    else:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
 
 
-def unlock(descriptor):
-    if os.name == "nt":
+def unlock(descriptor: int) -> None:
+    if sys.platform == "win32":
         os.lseek(descriptor, WINDOWS_LOCK_OFFSET, os.SEEK_SET)
         msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
     else:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
-def read_owner(path):
+def read_owner(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -87,7 +92,7 @@ def read_owner(path):
     return value if isinstance(value, dict) else {}
 
 
-def write_owner(path, owner):
+def write_owner(path: Path, owner: dict[str, Any]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(owner, indent=2) + "\n", encoding="utf-8")
     for attempt in range(4):
@@ -101,7 +106,7 @@ def write_owner(path, owner):
 
 
 @contextmanager
-def project_lock(root, command):
+def project_lock(root: Path, command: str) -> Iterator[str | None]:
     """Hold the project lock, or join it when started by the holder's own verifier call."""
     key = root.resolve()
     if key in _held:

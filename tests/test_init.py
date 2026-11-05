@@ -293,9 +293,11 @@ class InitTests(unittest.TestCase):
 
     def test_ready_is_successful_in_public_cli(self):
         from harness.__main__ import main
-        for extra, options in [([], {"implementer": "codex", "review_model": None, "implement_model": None}),
+        for extra, options in [([], {"implementer": "codex", "review_model": None, "implement_model": None,
+                                     "python": None}),
                                (["--implementer", "claude", "--review-model", "opus", "--implement-model", "sonnet"],
-                                {"implementer": "claude", "review_model": "opus", "implement_model": "sonnet"})]:
+                                {"implementer": "claude", "review_model": "opus", "implement_model": "sonnet",
+                                 "python": None})]:
             with self.subTest(extra=extra), \
                     patch("sys.argv", ["harness", "--root", str(self.root), "init", "--brief", str(self.brief), *extra]), \
                     patch("harness.__main__.run_init", return_value={"status": "ready"}) as initialize, \

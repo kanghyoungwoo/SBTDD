@@ -42,18 +42,32 @@ Harness는 세 가지 개발 방식을 연결해 이 확인 과정을 명시적�
 
 Harness의 Python 런타임 의존성은 표준 라이브러리뿐입니다. AI 실행기는 설치된 CLI의 로그인과 모델 설정을 사용합니다. 실제 모델 호출은 해당 계정의 사용량을 소모합니다.
 
-저장소를 내려받은 뒤 **저장소 루트에서** 아래 명령을 실행합니다. 가상환경은 선택 사항입니다.
+저장소를 내려받은 뒤 **저장소 루트에서** 아래 명령을 실행합니다.
 
 ```powershell
 python --version
 python -m harness --help
 ```
 
-다른 디렉터리에서도 사용하려면 선택적으로 로컬 패키지를 설치할 수 있습니다.
+다른 디렉터리에서 쓰려면 Harness를 프로젝트와 **분리된 환경**에 설치합니다. 프로젝트의 가상환경에 설치하면 그 환경의 `.pth`·sitecustomize가 Harness 프로세스 안에서 실행되므로 권하지 않습니다. `doctor`의 `isolation` 항목이 이런 구성을 알려 줍니다.
 
 ```powershell
-python -m pip install -e .
+# 도구 전용 가상환경에 설치 (둘 중 하나)
+pipx install .
+uv tool install .
 harness --help
+
+# 또는 설치 없이 단일 파일로 실행 (Python 3.11 이상만 필요)
+python -B tools/build_zipapp.py        # dist/harness.pyz를 만들고 SHA-256을 출력
+python -I -S dist/harness.pyz --help
+```
+
+`harness.pyz`는 같은 소스에서 항상 같은 바이트로 만들어지므로, 다른 컴퓨터에 옮긴 파일을 SHA-256으로 대조할 수 있습니다.
+
+프로젝트에 자체 가상환경이 있으면 `--python`으로 그 인터프리터를 지정합니다. 검사 명령의 `{python}`만 그 인터프리터로 실행되고, Harness와 검증기는 자기 인터프리터로 실행됩니다.
+
+```powershell
+harness --root PROJECT --python PROJECT/.venv/bin/python run     # Windows: PROJECT\.venv\Scripts\python.exe
 ```
 
 ## 빠른 시작: AI 없이 예제 검증하기
@@ -176,7 +190,8 @@ python -B -m harness --root ../NewProject status
 - ID는 계약 전체에서 고유해야 합니다. 모든 요구사항에 시나리오, 모든 시나리오에 acceptance 검사가 필요합니다.
 - 하나의 검사에 여러 시나리오를 연결할 수 있습니다. `unit` 검사는 필요한 경우 추가합니다.
 - 입력 경로는 프로젝트 내부의 기존 파일·디렉터리여야 합니다. `harness.json` 자체는 항상 추적합니다.
-- 명령은 프로젝트 루트에서 실행하는 인자 배열입니다. `{python}`은 Harness를 실행한 Python으로 치환합니다. 셸 문법은 해석하지 않습니다.
+- 명령은 프로젝트 루트에서 실행하는 인자 배열입니다. `{python}`은 `--python`으로 지정한 인터프리터, 지정하지 않으면 Harness를 실행한 Python으로 치환합니다. 셸 문법은 해석하지 않습니다.
+- Python이 아닌 프로젝트는 `["npm", "test"]`, `["go", "test", "./..."]`처럼 도구를 직접 적습니다. `{python}` 외의 자리표시자는 없습니다.
 - 검사 명령의 종료 코드 0을 통과로 처리합니다. 명령이 실제 assertion을 실행하도록 구성해야 합니다.
 - 검증 CLI만 사용할 때는 `agent` 설정을 생략할 수 있습니다.
 
@@ -241,7 +256,7 @@ Codex 단독 흐름은 Claude 단계를 생략하며, 이미 통과한 대상은
 
 ## 명령 모음
 
-아래 명령의 `PROJECT`, `ID`, `FILE`은 실제 경로·ID로 바꿉니다. `--root`를 생략하면 현재 디렉터리를 대상으로 합니다.
+아래 명령의 `PROJECT`, `ID`, `FILE`, `PYTHON`은 실제 경로·ID로 바꿉니다. `--root`를 생략하면 현재 디렉터리를 대상으로 합니다. `python -m harness` 대신 설치한 `harness` 명령이나 `python -I -S dist/harness.pyz`를 써도 같습니다. `--root`와 `--python`은 명령 이름 앞에 둡니다.
 
 | 명령 | 역할 |
 | --- | --- |
@@ -249,6 +264,7 @@ Codex 단독 흐름은 Claude 단계를 생략하며, 이미 통과한 대상은
 | `python -m harness --root PROJECT check` | 계약 형식·참조·입력 경로 검증 |
 | `python -m harness --root PROJECT run` | 전체 검사 실행·증거 저장 |
 | `python -m harness --root PROJECT run --requirement ID` | 요구사항 하나에 연결된 검사 실행 |
+| `python -m harness --root PROJECT --python PYTHON run` | 검사의 `{python}`을 프로젝트 인터프리터로 실행 (agent·init·doctor도 같은 옵션) |
 | `python -m harness --root PROJECT status` | 현재 입력과 저장된 검사 결과 비교 |
 | `python -m harness --root PROJECT init --brief FILE` | 빈 프로젝트의 명세·테스트 뼈대 생성 |
 | `python -m harness --root PROJECT init --brief FILE --implementer claude` | Claude만으로 뼈대 생성, `claude` 흐름 계약 생성 |
@@ -307,6 +323,8 @@ AI 호출 자료에는 프롬프트, 응답 스키마, 응답 JSON, 표준 출�
 검증 입력을 순회할 때는 `.git`, `.harness`, `.venv`, `__pycache__`, `.pytest_cache`를 제외합니다. AI 수정 범위를 검사하는 전체 프로젝트 비교는 이 검증 입력 해시와 별개입니다.
 
 변경 감지는 크기·수정 시각이 그대로인 오래된 파일의 해시를 재사용하므로, 큰 `.venv`나 `.git`이 있어도 실행 중 첫 비교 이후에는 빠릅니다. Windows에서는 내용을 바꾼 뒤 크기와 수정 시각까지 되돌린 파일을 놓칠 수 있습니다(POSIX는 ctime으로 감지합니다).
+
+`agent`와 `init`이 호출하는 검증 CLI는 `python -I -S`로 실행됩니다. 프로젝트의 `harness.py`·`sitecustomize.py`·PYTHONPATH와, Harness를 실행한 환경의 `.pth` 파일이 검증기를 바꾸지 못합니다. 실행 기록의 `interpreters`에 Harness와 검사의 인터프리터가 남습니다.
 
 변경 감지는 호출 전후 비교이며 OS 보안 격리나 암호학적 증거 인증을 제공하지 않습니다. 실행 도중 변경 후 복원된 내용을 모두 탐지하지는 못합니다. 검사 명령은 프로젝트 코드를 실행하므로 신뢰할 수 있는 프로젝트에서 사용합니다.
 
@@ -380,7 +398,17 @@ python -B -m harness run
 python -B -m harness status
 ```
 
-테스트 모음은 CLI, AI 실행기, 역할 분리, 초기화, 변경 감지·증거 보호, 잠금을 다룹니다. 모든 테스트가 `harness.json`의 검사에 연결되어 있는지도 테스트로 확인합니다. 하네스 자체의 요구사항과 검사 연결은 [harness.json](harness.json), 상세 설계는 [SPEC.md](SPEC.md)를 참고하세요.
+타입 검사는 개발할 때만 합니다. Harness 실행에는 필요 없으며, `harness`와 `tools`는 mypy `--strict`를 Linux·Windows·macOS 분기 모두에서 통과합니다.
+
+```powershell
+uv run --only-group dev mypy                               # pyproject.toml에 고정한 mypy 사용
+python -m pip install mypy==2.3.1; python -m mypy          # uv가 없을 때
+python -m mypy --platform win32                            # 다른 OS 분기도 확인
+```
+
+GitHub Actions(`.github/workflows/ci.yml`)가 push마다 Ubuntu·Windows·macOS와 Python 3.11·3.13에서 테스트와 자기 계약 실행을, Ubuntu에서 타입 검사를 실행합니다.
+
+테스트 모음은 CLI, AI 실행기, 역할 분리, 초기화, 변경 감지·증거 보호, 잠금, 실행 환경 분리와 단일 파일 배포를 다룹니다. 모든 테스트가 `harness.json`의 검사에 연결되어 있는지도 테스트로 확인합니다. 하네스 자체의 요구사항과 검사 연결은 [harness.json](harness.json), 상세 설계는 [SPEC.md](SPEC.md)를 참고하세요.
 
 ## 현재 범위
 
