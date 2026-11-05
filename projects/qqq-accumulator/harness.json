@@ -1,0 +1,1584 @@
+{
+  "version": 1,
+  "inputs": [
+    "BRIEF.md",
+    "SPEC.md",
+    "src",
+    "tests"
+  ],
+  "agent": {
+    "workflow": "claude",
+    "code_paths": [
+      "src"
+    ],
+    "test_paths": [
+      "tests"
+    ]
+  },
+  "requirements": [
+    {
+      "id": "REQ-CONFIG-001",
+      "description": "설정 파일(TOML)의 숫자 결정값은 필수이며 기본값이 없다. 명령이 쓰는 값이 없거나 형식이 틀리면 그 명령은 주문 없이 종료 코드 2로 끝난다. stage가 없으면 dry-run이다."
+    },
+    {
+      "id": "REQ-DATA-001",
+      "description": "import-data는 달력·일봉·환율 CSV 스냅샷을 원자적으로 가져오고 SHA-256을 기록한다. 일봉은 원시 OHLC·거래량·분할 계수·주당 배당을 저장한다. 날짜 중복, 거래일 누락, 0 이하 가격, 달력 미포함이 있으면 아무것도 바꾸지 않고 종료 코드 2로 거부한다."
+    },
+    {
+      "id": "REQ-STORE-001",
+      "description": "저장소는 WAL 모드 SQLite 파일 하나이고 모든 테이블은 STRICT다. (거래일, 규칙)당 주문 1건을 DB UNIQUE 제약으로 보장한다."
+    },
+    {
+      "id": "REQ-BT-001",
+      "description": "백테스트 시뮬레이션: T일 종가로 판단한 주문을 T+1일 LOC로 체결하거나 미체결로 처리한다. 수량은 지정가 기준으로 주문 시점에 고정하고 소수점 미지원 시 내림하며 남은 현금은 이월한다. 기준선, 종가 X달러 이하 전액 매수 규칙, KRW 환산과 환전 비용, 배당 원천징수, 분할 이벤트, 수수료를 처리하고 규칙별 지표를 계산한다."
+    },
+    {
+      "id": "REQ-BT-002",
+      "description": "백테스트는 봉을 날짜순으로 하나씩 넘기며 지표를 증분 계산한다. T일까지의 판단은 T+1일 이후 데이터의 영향을 받지 않는다."
+    },
+    {
+      "id": "REQ-BT-003",
+      "description": "backtest 명령은 조정 구간과 평가 구간을 분리한 규칙별 지표, 시작 월을 바꾼 롤링 창 결과, 채택 판정, 선택 규칙(채택 규칙이 없으면 baseline), 데이터 파일 해시를 JSON으로 출력한다. 잘못된 rules 파일이면 종료 코드 2로 끝난다."
+    },
+    {
+      "id": "REQ-ORDER-001",
+      "description": "지정가는 직전 종가 × (1 + 지정가 여유)이다. 주문 금액은 규칙 금액, 주문가능금액, 1회 한도, 월 한도 잔액 중 최솟값이고 수량은 그 금액으로 내림 계산한다."
+    },
+    {
+      "id": "REQ-RUN-001",
+      "description": "run(paper, 주입된 FakeBroker)은 판단·안전 장치를 통과하면 SENDING을 커밋한 뒤 LOC 매수 1건을 전송한다. 다음 실행에서 체결·미체결을 대조해 반영하고, 같은 거래일에는 재주문하지 않는다. dry-run은 의도만 DRY_RUN으로 기록하고 전송하지 않는다. 1회 한도 적용 시 경고, 월 한도 소진 시 중단, 현금 부족 시 알림을 보낸다."
+    },
+    {
+      "id": "REQ-RUN-002",
+      "description": "결과를 모르는 SENDING 주문은 재전송하지 않고 증권사 주문 내역으로 연결한다. 찾지 못하면 UNKNOWN으로 두고 알린다. 장 마감 후 내역과 잔고로 확정하기 전에는 새 주문을 내지 않는다."
+    },
+    {
+      "id": "REQ-RUN-003",
+      "description": "매 실행은 증권사 보유 수량과 DB 보유 수량을 대조한다(분할 반영 포함). 불일치하면 신규 주문을 중단하고 알리며, adjust로 사유를 기록하고 수량이 맞을 때만 재개한다."
+    },
+    {
+      "id": "REQ-RUN-004",
+      "description": "휴장일, 달력 정보 없음, 주문 시간대 밖, 직전 거래일 봉 없음, 분할 기록 없는 이상 가격, HALT 파일, live 단계, 증권사 어댑터 없음, 시간대 데이터 없음이면 주문 전송 0회로 정해진 사유와 종료 코드를 남긴다."
+    },
+    {
+      "id": "REQ-RUN-005",
+      "description": "주문 시간대 판단은 America/New_York 기준이다. 서머타임 전환과 무관하게 뉴욕 시각으로 판단하고, 조기 폐장일에는 달력 마감 시각에 맞춰 시간대를 앞당긴다."
+    },
+    {
+      "id": "REQ-NOTIFY-001",
+      "description": "거래일마다 결과 요약을 1건 보낸다(주문이 없는 날 포함). 안전 장치와 오류는 즉시 보낸다(안전 장치·경고는 날짜·사유당 1회). 알림 실패는 주문 상태와 종료 코드를 바꾸지 않는다."
+    },
+    {
+      "id": "REQ-STATUS-001",
+      "description": "status는 누적 주수, 평균 단가, 최근 주문, 중단 사유를 JSON으로 출력하고, adjust는 보유 수량 차이와 사유를 기록한다."
+    },
+    {
+      "id": "REQ-TEST-001",
+      "description": "기본 테스트는 네트워크 없이 FakeBroker와 FakeNotifier로 실행된다."
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "SCN-CONFIG-001",
+      "requirement": "REQ-CONFIG-001",
+      "given": "픽스처 F 데이터를 가져온 DB와, limits.per_order_usd만 빠진 설정 파일",
+      "when": "main([\"--config\", 설정, \"run\"], broker=FakeBroker(500, 0), notifier=FakeNotifier(), now=2026-11-05 15:30 ET)",
+      "then": "반환값 2, FakeBroker.place_calls == 0, FakeNotifier에 kind \"ERROR\" 알림 1건 이상"
+    },
+    {
+      "id": "SCN-CONFIG-002",
+      "requirement": "REQ-CONFIG-001",
+      "given": "order.limit_margin_pct = \"abc\"(문자열)인 설정과 유효한 rules 파일",
+      "when": "main([\"--config\", 설정, \"backtest\", \"--rules\", rules])",
+      "then": "반환값 2, stdout이 비어 있음"
+    },
+    {
+      "id": "SCN-CONFIG-003",
+      "requirement": "REQ-CONFIG-001",
+      "given": "stage 키가 없는 설정 파일",
+      "when": "load_config(경로)",
+      "then": "config.stage == \"dry-run\""
+    },
+    {
+      "id": "SCN-CONFIG-004",
+      "requirement": "REQ-CONFIG-001",
+      "given": "paths.database만 있고 숫자 결정값이 하나도 없는 설정과 유효한 달력 CSV",
+      "when": "main([\"--config\", 설정, \"import-data\", \"--file\", 달력CSV])",
+      "then": "반환값 0"
+    },
+    {
+      "id": "SCN-DATA-001",
+      "requirement": "REQ-DATA-001",
+      "given": "달력 2026-11-02~2026-11-06 평일 개장(16:00)을 가져온 DB와, 같은 5일의 일봉 CSV(2026-11-04 행: open 99.5, high 101.25, low 98, close 100, volume 1234, split_factor 1, dividend 0.25)",
+      "when": "import_csv(store, 일봉CSV)",
+      "then": "ImportResult.kind == \"bars\", rows == 5, sha256 == 파일 바이트의 SHA-256 16진수. 저장된 2026-11-04 봉의 각 값이 Decimal(\"99.5\"), Decimal(\"101.25\"), Decimal(\"98\"), Decimal(\"100\"), 1234, Decimal(\"1\"), Decimal(\"0.25\")"
+    },
+    {
+      "id": "SCN-DATA-002",
+      "requirement": "REQ-DATA-001",
+      "given": "SCN-DATA-001의 일봉을 이미 가져온 DB와, 2026-11-03이 두 번 나오는 새 일봉 CSV",
+      "when": "main([\"--config\", 설정, \"import-data\", \"--file\", 새CSV])",
+      "then": "반환값 2, DB의 일봉은 이전 5건 그대로이고 기록된 해시도 이전 파일 해시 그대로"
+    },
+    {
+      "id": "SCN-DATA-003",
+      "requirement": "REQ-DATA-001",
+      "given": "달력 2026-11-02~11-06 개장, 2026-11-04 행이 빠진 일봉 CSV",
+      "when": "import_csv(store, CSV)",
+      "then": "DataImportError 발생, 저장된 일봉 0건"
+    },
+    {
+      "id": "SCN-DATA-004",
+      "requirement": "REQ-DATA-001",
+      "given": "달력 2026-11-02~11-06 개장, 2026-11-05 close가 0인 일봉 CSV와, 별도로 2026-11-05 open이 -1인 일봉 CSV",
+      "when": "각 CSV를 import_csv로 가져온다",
+      "then": "두 경우 모두 DataImportError, 저장된 일봉 0건"
+    },
+    {
+      "id": "SCN-DATA-005",
+      "requirement": "REQ-DATA-001",
+      "given": "달력이 2026-11-02~11-06만 있고 일봉 CSV가 2026-11-02~2026-11-09",
+      "when": "import_csv(store, CSV)",
+      "then": "DataImportError 발생(달력 미포함), 저장된 일봉 0건"
+    },
+    {
+      "id": "SCN-STORE-001",
+      "requirement": "REQ-STORE-001",
+      "given": "새 경로",
+      "when": "Store.open(경로)로 DB를 만든 뒤 sqlite3로 PRAGMA journal_mode와 sqlite_master의 table SQL을 조회한다",
+      "then": "journal_mode == \"wal\", 프로그램이 만든 모든 테이블의 CREATE 문에 STRICT 포함"
+    },
+    {
+      "id": "SCN-STORE-002",
+      "requirement": "REQ-STORE-001",
+      "given": "insert_order_intent(2026-11-05, \"le200\", 4, 102.00, \"SENDING\")가 이미 성공한 DB",
+      "when": "insert_order_intent(2026-11-05, \"le200\", 2, 102.00, \"SENDING\")를 다시 호출한다",
+      "then": "DuplicateOrderError 발생, list_orders()에서 2026-11-05/le200 행은 1건이고 quantity 4"
+    },
+    {
+      "id": "SCN-BT-001",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 6개 종가 100,100,50,50,100,100(OHLC 동일, 분할 1, 배당 0), USD 입금 100, every_n_trading_days n=2, 수수료 0, 지정가 여유 0, fractional true",
+      "when": "simulate(bars, [], settings)",
+      "then": "baseline decisions가 (1일차, 수량 1, 지정가 100), (3일차, 2, 50), (5일차, 1, 100). metrics[baseline]: final_shares 4, cash_usd 0, equivalent_shares 4, total_deposit_usd 300, average_cost_usd 75, unfilled_count 0, cash_waiting_days 0"
+    },
+    {
+      "id": "SCN-BT-002",
+      "requirement": "REQ-BT-001",
+      "given": "SCN-BT-001과 같은 데이터·설정, 규칙 Rule(\"le60\", \"close_at_or_below\", 60)",
+      "when": "simulate(bars, [le60], settings)",
+      "then": "le60 decisions가 (3일차, 수량 4, 지정가 50) 1건뿐이고 4일차에 체결된다. metrics[le60]: final_shares 4, cash_usd 100, equivalent_shares 5, total_deposit_usd 300, average_cost_usd 50, unfilled_count 0, cash_waiting_days 4, final_shares_diff_vs_baseline 0, equivalent_shares_diff_vs_baseline 1"
+    },
+    {
+      "id": "SCN-BT-003",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 4개 종가 모두 100, USD 입금 250, n=2, 수수료 0, 여유 0, fractional false",
+      "when": "simulate(bars, [], settings)",
+      "then": "baseline decisions (1일차, 2, 100), (3일차, 3, 100). final_shares 5, cash_usd 0, total_deposit_usd 500"
+    },
+    {
+      "id": "SCN-BT-004",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 2개 종가 100, 101, USD 입금 100, n=10, 수수료 0, 여유 0, fractional true",
+      "when": "simulate(bars, [], settings)",
+      "then": "baseline final_shares 0, cash_usd 100, unfilled_count 1, equivalent_shares 100/101을 0.000001 내림한 0.990099"
+    },
+    {
+      "id": "SCN-BT-005",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 2개 종가 100, 100, KRW 입금 130000, n=10, 환율 1일차 1300, 환전 비용 1%, 수수료 0, 여유 0, fractional true",
+      "when": "simulate(bars, [], settings, fx_rates)",
+      "then": "baseline total_deposit_usd 99.00, final_shares 0.99, cash_usd 0"
+    },
+    {
+      "id": "SCN-BT-006",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 3개 종가 100,100,100, 3일차 dividend 0.5, USD 입금 400, n=10, 원천징수 15%, 수수료 0, 여유 0, fractional false",
+      "when": "simulate(bars, [], settings)",
+      "then": "2일차에 4주 체결. 3일차 배당 1.70 입금. baseline final_shares 4, cash_usd 1.70, total_deposit_usd 400(배당은 입금액에 포함하지 않음)"
+    },
+    {
+      "id": "SCN-BT-007",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 3개 종가 100, 100, 50이고 3일차 split_factor 2, USD 입금 100, n=10, 수수료 0, 여유 0, fractional true",
+      "when": "simulate(bars, [], settings)",
+      "then": "2일차 1주 체결 후 3일차 보유 2주. baseline final_shares 2, equivalent_shares 2, average_cost_usd 50"
+    },
+    {
+      "id": "SCN-BT-008",
+      "requirement": "REQ-BT-001",
+      "given": "거래일 2개 종가 100, 100, USD 입금 101, n=10, 수수료 1%, 여유 0, fractional false",
+      "when": "simulate(bars, [], settings)",
+      "then": "decision 수량 1, 지정가 100. 2일차 체결 대금 100 + 수수료 1.00. final_shares 1, cash_usd 0, average_cost_usd 101"
+    },
+    {
+      "id": "SCN-BT-009",
+      "requirement": "REQ-BT-002",
+      "given": "데이터 A = SCN-BT-001의 6일. 데이터 B = 1~3일차는 A와 같고 4~6일차 종가가 10, 500, 1. 설정은 SCN-BT-001과 같고 규칙 le60",
+      "when": "A와 B를 각각 simulate한다",
+      "then": "판단일이 3일차 이하인 decisions(baseline과 le60 모두)가 A와 B에서 같다"
+    },
+    {
+      "id": "SCN-BT-010",
+      "requirement": "REQ-BT-003",
+      "given": "달력 2024-01-01~2025-12-31 모든 평일 개장(16:00), 같은 기간 평일 일봉 종가 100(파일 해시 H), USD 월 입금 100(cycle monthly, day 1), 수수료 0, 여유 0, fractional true, holdout_years 1, rolling_window_years 1, min_outperformance_pct 0, min_rolling_ratio_pct 50, rules 파일에 le60",
+      "when": "main([\"--config\", 설정, \"backtest\", \"--rules\", rules])",
+      "then": "반환값 0. stdout JSON의 data.bars_sha256 == H, segments.evaluation.start == \"2025-01-01\", segments.tuning.end == \"2024-12-31\", rolling.le60.windows == 13, adoption.le60.adopted == false, selected_rule == \"baseline\". segments.evaluation.rules.baseline에 final_shares, cash_usd, equivalent_shares, total_deposit_usd, average_cost_usd, cash_waiting_days, unfilled_count, final_shares_diff_vs_baseline 키가 있음"
+    },
+    {
+      "id": "SCN-BT-011",
+      "requirement": "REQ-BT-003",
+      "given": "평가 구간 규칙 105주, 기준선 100주, 롤링 쌍 10개 중 7개는 규칙 ≥ 기준선, min_outperformance_pct 3, min_rolling_ratio_pct 60",
+      "when": "evaluate_adoption(...)",
+      "then": "adopted True, outperformance_pct 5, rolling_ratio_pct 70"
+    },
+    {
+      "id": "SCN-BT-012",
+      "requirement": "REQ-BT-003",
+      "given": "(a) 규칙 102, 기준선 100, 롤링 10개 중 10개 ≥, 기준 3%/60%. (b) 규칙 105, 기준선 100, 롤링 10개 중 5개 ≥, 기준 3%/60%",
+      "when": "각각 evaluate_adoption(...)",
+      "then": "(a) adopted False, outperformance_pct 2. (b) adopted False, rolling_ratio_pct 50"
+    },
+    {
+      "id": "SCN-BT-013",
+      "requirement": "REQ-BT-003",
+      "given": "SCN-BT-010의 DB·설정과, type이 \"rsi\"인 규칙이 들어 있는 rules 파일",
+      "when": "main([\"--config\", 설정, \"backtest\", \"--rules\", rules])",
+      "then": "반환값 2, stdout 비어 있음"
+    },
+    {
+      "id": "SCN-ORD-001",
+      "requirement": "REQ-ORDER-001",
+      "given": "prev_close 100, limit_margin_pct 2, rule_amount 500, orderable_cash 500, per_order 1000, monthly_remaining 5000, fee 0, fractional false",
+      "when": "compute_order(...)",
+      "then": "limit_price 102.00, quantity 4, reason None"
+    },
+    {
+      "id": "SCN-ORD-002",
+      "requirement": "REQ-ORDER-001",
+      "given": "prev_close 100, 여유 2, rule_amount 500, orderable_cash 500, per_order 300, monthly_remaining 5000, fee 0, fractional false",
+      "when": "compute_order(...)",
+      "then": "limit_price 102.00, quantity 2, amount 300, binding \"PER_ORDER_LIMIT\""
+    },
+    {
+      "id": "SCN-ORD-003",
+      "requirement": "REQ-ORDER-001",
+      "given": "prev_close 100, 여유 2, rule_amount 50, orderable_cash 50, per_order 1000, monthly_remaining 5000, fee 0, fractional false",
+      "when": "compute_order(...)",
+      "then": "quantity 0, reason \"INSUFFICIENT_CASH\""
+    },
+    {
+      "id": "SCN-RUN-001",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F",
+      "when": "run_once(config, store, broker, notifier, now=2026-11-05 15:30 ET)",
+      "then": "exit_code 0, orders_sent 1, place_calls 1. 전송 요청은 symbol QQQ, trade_date 2026-11-05, quantity 4, limit_price 102.00. list_orders()[0].status == \"SENT\"이고 broker_order_id가 비어 있지 않음"
+    },
+    {
+      "id": "SCN-RUN-002",
+      "requirement": "REQ-RUN-001",
+      "given": "SCN-RUN-001 이후 FakeBroker.settle_close(2026-11-05, 98)",
+      "when": "run_once(..., now=2026-11-05 16:30 ET)",
+      "then": "주문 상태 FILLED, fill_price 98, fill_cost 392.00, store.holdings() == 4, broker.get_orderable_cash_usd() == 108.00, place_calls 1"
+    },
+    {
+      "id": "SCN-RUN-003",
+      "requirement": "REQ-RUN-001",
+      "given": "SCN-RUN-001 이후 FakeBroker.settle_close(2026-11-05, 103)",
+      "when": "run_once(..., now=2026-11-05 16:30 ET) 후 run_once(..., now=2026-11-05 15:45 ET 시각으로 다시 설정한 실행)",
+      "then": "주문 상태 UNFILLED, holdings 0, 두 실행 모두 orders_sent 0, place_calls 1, 두 번째 실행 reasons에 \"ALREADY_ORDERED\""
+    },
+    {
+      "id": "SCN-RUN-004",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F",
+      "when": "run_once(now=2026-11-05 15:30 ET) 후 run_once(now=2026-11-05 15:45 ET)",
+      "then": "place_calls 1, 두 번째 결과 exit_code 0, orders_sent 0, reasons에 \"ALREADY_ORDERED\""
+    },
+    {
+      "id": "SCN-RUN-005",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F에서 stage만 \"dry-run\"",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 0, place_calls 0, list_orders()에 status DRY_RUN, quantity 4, limit_price 102.00 행 1건, reasons에 \"DRY_RUN_RECORDED\""
+    },
+    {
+      "id": "SCN-RUN-006",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F에서 per_order_usd 300",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 0, 전송 수량 2, 지정가 102.00, FakeNotifier에 kind WARNING, reason \"PER_ORDER_LIMIT_APPLIED\" 1건"
+    },
+    {
+      "id": "SCN-RUN-007",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F에서 monthly_usd 400. 2026-11-04 15:30 ET 실행으로 4주 지정가 102.00 주문을 보내고, settle_close(2026-11-04, 100)를 한 뒤 2026-11-04 16:30 ET 실행으로 FILLED 400.00을 반영했다. 그다음 FakeBroker 주문가능금액을 500으로 다시 설정",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 1, reasons에 \"MONTHLY_LIMIT_REACHED\", place_calls 총 1, FakeNotifier에 kind SAFETY, reason MONTHLY_LIMIT_REACHED 1건"
+    },
+    {
+      "id": "SCN-RUN-008",
+      "requirement": "REQ-RUN-001",
+      "given": "픽스처 F에서 FakeBroker 주문가능금액 50",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 0, place_calls 0, 주문 행 0건, reasons에 \"INSUFFICIENT_CASH\", FakeNotifier에 kind WARNING, reason INSUFFICIENT_CASH 1건"
+    },
+    {
+      "id": "SCN-REC-001",
+      "requirement": "REQ-RUN-002",
+      "given": "픽스처 F에서 FakeBroker.fail_next_place(\"timeout_after_accept\")",
+      "when": "run_once(now=15:30 ET) 후 run_once(now=15:45 ET), 날짜는 2026-11-05",
+      "then": "첫 결과 exit_code 2, 주문 상태 SENDING. 두 번째 결과 후 주문 상태 SENT이고 broker_order_id가 FakeBroker의 접수 주문 id와 같음. place_calls 1"
+    },
+    {
+      "id": "SCN-REC-002",
+      "requirement": "REQ-RUN-002",
+      "given": "픽스처 F에서 FakeBroker.fail_next_place(\"timeout_before_accept\")",
+      "when": "2026-11-05 15:30 ET 실행 후 15:40 ET 실행",
+      "then": "첫 결과 exit_code 2. 두 번째 결과 exit_code 1, 주문 상태 UNKNOWN, reasons에 \"UNRESOLVED_ORDER\", place_calls 1, FakeNotifier에 kind SAFETY 알림 1건 이상"
+    },
+    {
+      "id": "SCN-REC-003",
+      "requirement": "REQ-RUN-002",
+      "given": "SCN-REC-002 상태(UNKNOWN, 증권사 보유 0 = DB 보유 0)와 2026-11-05 일봉(종가 100) 추가 스냅샷",
+      "when": "2026-11-05 16:30 ET 실행 후 2026-11-06 15:30 ET 실행",
+      "then": "16:30 실행 후 2026-11-05 주문 상태 NOT_PLACED. 2026-11-06 실행은 exit_code 0, orders_sent 1, place_calls 총 2"
+    },
+    {
+      "id": "SCN-POS-001",
+      "requirement": "REQ-RUN-003",
+      "given": "픽스처 F에 adjust(shares 10, reason \"초기 보유\")로 DB 보유 10, FakeBroker position 11",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 1, reasons에 \"POSITION_MISMATCH\", place_calls 0, FakeNotifier에 kind SAFETY, reason POSITION_MISMATCH 1건"
+    },
+    {
+      "id": "SCN-POS-002",
+      "requirement": "REQ-RUN-003",
+      "given": "SCN-POS-001 이후 adjust 없이 FakeBroker.set_position(10)",
+      "when": "run_once(now=2026-11-05 15:40 ET)",
+      "then": "exit_code 1, reasons에 \"POSITION_MISMATCH\", place_calls 0"
+    },
+    {
+      "id": "SCN-POS-003",
+      "requirement": "REQ-RUN-003",
+      "given": "SCN-POS-001 이후(증권사 11주) main([\"--config\", 설정, \"adjust\", \"--shares\", \"1\", \"--reason\", \"수동 매수 반영\"])가 0을 반환",
+      "when": "run_once(now=2026-11-05 15:40 ET)",
+      "then": "store.holdings() == 11, exit_code 0, orders_sent 1"
+    },
+    {
+      "id": "SCN-POS-004",
+      "requirement": "REQ-RUN-003",
+      "given": "픽스처 F에서 2026-11-04 봉이 close 50, split_factor 2이고 2026-11-03 close 100. adjust로 DB 보유 10, FakeBroker position 20. 주문가능금액 500",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "store.holdings() == 20. reasons에 POSITION_MISMATCH와 ABNORMAL_PRICE가 없음. exit_code 0, 전송 지정가 51.00, 수량 9"
+    },
+    {
+      "id": "SCN-POS-005",
+      "requirement": "REQ-STATUS-001",
+      "given": "픽스처 F DB",
+      "when": "main([\"--config\", 설정, \"adjust\", \"--shares\", \"1\", \"--reason\", \"\"])",
+      "then": "반환값 2, store.holdings() == 0"
+    },
+    {
+      "id": "SCN-GRD-001",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F(일봉 2026-11-25까지 확장)",
+      "when": "run_once(now=2026-11-26 15:30 ET)",
+      "then": "exit_code 0, place_calls 0, reasons에 \"MARKET_CLOSED\""
+    },
+    {
+      "id": "SCN-GRD-002",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F",
+      "when": "run_once(now=2027-01-04 15:30 ET)",
+      "then": "exit_code 1, place_calls 0, reasons에 \"CALENDAR_MISSING\""
+    },
+    {
+      "id": "SCN-GRD-003",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F에서 일봉이 2026-11-03까지만 있음",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 1, place_calls 0, reasons에 \"STALE_BAR\""
+    },
+    {
+      "id": "SCN-GRD-004",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F에서 2026-11-04 close 80(split_factor 1), 2026-11-03 close 100, abnormal_price_pct 10",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 1, place_calls 0, reasons에 \"ABNORMAL_PRICE\""
+    },
+    {
+      "id": "SCN-GRD-005",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F에서 paths.halt_file 경로에 빈 파일이 있음",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "exit_code 1, place_calls 0, reasons에 \"HALT_FILE\""
+    },
+    {
+      "id": "SCN-GRD-006",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F에서 stage \"live\"",
+      "when": "run_once(..., broker=FakeBroker(500, 0), now=2026-11-05 15:30 ET)",
+      "then": "exit_code 2, place_calls 0, reasons에 \"STAGE_NOT_SUPPORTED\""
+    },
+    {
+      "id": "SCN-GRD-007",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F 설정(stage paper)",
+      "when": "main([\"--config\", 설정, \"run\"], broker=None, notifier=FakeNotifier(), now=2026-11-05 15:30 ET)",
+      "then": "반환값 2, DB 주문 행 0건"
+    },
+    {
+      "id": "SCN-GRD-008",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F와, 호출하면 zoneinfo.ZoneInfoNotFoundError를 내는 tz_loader",
+      "when": "run_once(..., now=2026-11-05 20:30 UTC aware, tz_loader=그 함수)",
+      "then": "exit_code 2, place_calls 0, reasons에 \"TIMEZONE_UNAVAILABLE\""
+    },
+    {
+      "id": "SCN-GRD-009",
+      "requirement": "REQ-RUN-004",
+      "given": "픽스처 F",
+      "when": "run_once(now=2026-11-05 14:00 ET)",
+      "then": "exit_code 0, place_calls 0, reasons에 \"OUTSIDE_WINDOW\""
+    },
+    {
+      "id": "SCN-TIME-001",
+      "requirement": "REQ-RUN-005",
+      "given": "window 15:00–15:45, close_time 16:00",
+      "when": "is_in_order_window를 2026-10-31 04:30 Asia/Seoul, 2026-11-03 05:30 Asia/Seoul, 2026-11-03 05:50 Asia/Seoul로 각각 호출",
+      "then": "True, True, False"
+    },
+    {
+      "id": "SCN-TIME-002",
+      "requirement": "REQ-RUN-005",
+      "given": "window 15:00–15:45, 2026-11-27 close_time 13:00",
+      "when": "is_in_order_window를 2026-11-27 12:30 ET와 2026-11-27 15:30 ET로 각각 호출",
+      "then": "True, False"
+    },
+    {
+      "id": "SCN-NTF-001",
+      "requirement": "REQ-NOTIFY-001",
+      "given": "픽스처 F에서 operating_rule threshold 50(종가 100이라 신호 없음)",
+      "when": "2026-11-05의 15:30, 16:15, 16:30 ET에 run_once를 차례로 실행",
+      "then": "15:30 결과 reasons에 \"NO_SIGNAL\", exit_code 0. FakeNotifier에 kind DAILY_SUMMARY, trade_date 2026-11-05 알림이 정확히 1건이고 16:15 실행에서 보냄"
+    },
+    {
+      "id": "SCN-NTF-002",
+      "requirement": "REQ-NOTIFY-001",
+      "given": "픽스처 F에서 FakeNotifier(fail=True), per_order_usd 300(경고 알림 발생)",
+      "when": "run_once(now=2026-11-05 15:30 ET)",
+      "then": "예외 없이 exit_code 0, 주문 상태 SENT, 수량 2, place_calls 1"
+    },
+    {
+      "id": "SCN-NTF-003",
+      "requirement": "REQ-NOTIFY-001",
+      "given": "픽스처 F에서 HALT 파일이 있음",
+      "when": "2026-11-05 15:00, 15:15 ET에 run_once를 두 번 실행",
+      "then": "첫 실행 직후 FakeNotifier에 kind SAFETY, reason HALT_FILE 1건이 있고, 두 번째 실행 후에도 그 알림은 총 1건"
+    },
+    {
+      "id": "SCN-STS-001",
+      "requirement": "REQ-STATUS-001",
+      "given": "SCN-RUN-002 완료 상태",
+      "when": "main([\"--config\", 설정, \"status\"])",
+      "then": "반환값 0. stdout JSON shares == \"4\"(Decimal 비교), average_cost_usd == 98, recent_orders[0]의 status FILLED, quantity 4, limit_price 102.00, active_halts == []"
+    },
+    {
+      "id": "SCN-STS-002",
+      "requirement": "REQ-STATUS-001",
+      "given": "SCN-POS-001 완료 상태",
+      "when": "main([\"--config\", 설정, \"status\"])",
+      "then": "반환값 0, active_halts에 \"POSITION_MISMATCH\", last_run.exit_code == 1"
+    },
+    {
+      "id": "SCN-OFF-001",
+      "requirement": "REQ-TEST-001",
+      "given": "socket.socket과 socket.create_connection을 호출하면 예외를 내도록 패치한 상태와 픽스처 F",
+      "when": "run_once(now=2026-11-05 15:30 ET)를 실행하고 settle_close(2026-11-05, 98) 후 16:30 ET에 다시 실행",
+      "then": "소켓 예외 없이 첫 결과 exit_code 0, 이후 주문 상태 FILLED"
+    }
+  ],
+  "checks": [
+    {
+      "id": "CHK-001",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-CONFIG-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_001.py"
+      ]
+    },
+    {
+      "id": "CHK-002",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-CONFIG-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_002.py"
+      ]
+    },
+    {
+      "id": "CHK-003",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-CONFIG-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_003.py"
+      ]
+    },
+    {
+      "id": "CHK-004",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-CONFIG-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_004.py"
+      ]
+    },
+    {
+      "id": "CHK-005",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-DATA-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_005.py"
+      ]
+    },
+    {
+      "id": "CHK-006",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-DATA-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_006.py"
+      ]
+    },
+    {
+      "id": "CHK-007",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-DATA-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_007.py"
+      ]
+    },
+    {
+      "id": "CHK-008",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-DATA-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_008.py"
+      ]
+    },
+    {
+      "id": "CHK-009",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-DATA-005"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_009.py"
+      ]
+    },
+    {
+      "id": "CHK-010",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-STORE-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_010.py"
+      ]
+    },
+    {
+      "id": "CHK-011",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-STORE-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_011.py"
+      ]
+    },
+    {
+      "id": "CHK-012",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_012.py"
+      ]
+    },
+    {
+      "id": "CHK-013",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_013.py"
+      ]
+    },
+    {
+      "id": "CHK-014",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_014.py"
+      ]
+    },
+    {
+      "id": "CHK-015",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_015.py"
+      ]
+    },
+    {
+      "id": "CHK-016",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-005"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_016.py"
+      ]
+    },
+    {
+      "id": "CHK-017",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-006"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_017.py"
+      ]
+    },
+    {
+      "id": "CHK-018",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-007"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_018.py"
+      ]
+    },
+    {
+      "id": "CHK-019",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-008"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_019.py"
+      ]
+    },
+    {
+      "id": "CHK-020",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-009"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_020.py"
+      ]
+    },
+    {
+      "id": "CHK-021",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-010"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_021.py"
+      ]
+    },
+    {
+      "id": "CHK-022",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-011"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_022.py"
+      ]
+    },
+    {
+      "id": "CHK-023",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-012"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_023.py"
+      ]
+    },
+    {
+      "id": "CHK-024",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-BT-013"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_024.py"
+      ]
+    },
+    {
+      "id": "CHK-025",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-ORD-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_025.py"
+      ]
+    },
+    {
+      "id": "CHK-026",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-ORD-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_026.py"
+      ]
+    },
+    {
+      "id": "CHK-027",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-ORD-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_027.py"
+      ]
+    },
+    {
+      "id": "CHK-028",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_028.py"
+      ]
+    },
+    {
+      "id": "CHK-029",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_029.py"
+      ]
+    },
+    {
+      "id": "CHK-030",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_030.py"
+      ]
+    },
+    {
+      "id": "CHK-031",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_031.py"
+      ]
+    },
+    {
+      "id": "CHK-032",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-005"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_032.py"
+      ]
+    },
+    {
+      "id": "CHK-033",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-006"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_033.py"
+      ]
+    },
+    {
+      "id": "CHK-034",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-007"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_034.py"
+      ]
+    },
+    {
+      "id": "CHK-035",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-RUN-008"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_035.py"
+      ]
+    },
+    {
+      "id": "CHK-036",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-REC-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_036.py"
+      ]
+    },
+    {
+      "id": "CHK-037",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-REC-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_037.py"
+      ]
+    },
+    {
+      "id": "CHK-038",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-REC-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_038.py"
+      ]
+    },
+    {
+      "id": "CHK-039",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-POS-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_039.py"
+      ]
+    },
+    {
+      "id": "CHK-040",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-POS-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_040.py"
+      ]
+    },
+    {
+      "id": "CHK-041",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-POS-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_041.py"
+      ]
+    },
+    {
+      "id": "CHK-042",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-POS-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_042.py"
+      ]
+    },
+    {
+      "id": "CHK-043",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-POS-005"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_043.py"
+      ]
+    },
+    {
+      "id": "CHK-044",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_044.py"
+      ]
+    },
+    {
+      "id": "CHK-045",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_045.py"
+      ]
+    },
+    {
+      "id": "CHK-046",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_046.py"
+      ]
+    },
+    {
+      "id": "CHK-047",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-004"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_047.py"
+      ]
+    },
+    {
+      "id": "CHK-048",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-005"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_048.py"
+      ]
+    },
+    {
+      "id": "CHK-049",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-006"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_049.py"
+      ]
+    },
+    {
+      "id": "CHK-050",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-007"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_050.py"
+      ]
+    },
+    {
+      "id": "CHK-051",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-008"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_051.py"
+      ]
+    },
+    {
+      "id": "CHK-052",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-GRD-009"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_052.py"
+      ]
+    },
+    {
+      "id": "CHK-053",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-TIME-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_053.py"
+      ]
+    },
+    {
+      "id": "CHK-054",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-TIME-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_054.py"
+      ]
+    },
+    {
+      "id": "CHK-055",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-NTF-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_055.py"
+      ]
+    },
+    {
+      "id": "CHK-056",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-NTF-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_056.py"
+      ]
+    },
+    {
+      "id": "CHK-057",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-NTF-003"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_057.py"
+      ]
+    },
+    {
+      "id": "CHK-058",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-STS-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_058.py"
+      ]
+    },
+    {
+      "id": "CHK-059",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-STS-002"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_059.py"
+      ]
+    },
+    {
+      "id": "CHK-060",
+      "kind": "acceptance",
+      "scenarios": [
+        "SCN-OFF-001"
+      ],
+      "command": [
+        "{python}",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_scenario_060.py"
+      ]
+    }
+  ]
+}

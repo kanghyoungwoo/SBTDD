@@ -1,0 +1,4 @@
+# Harness 실행 기록에는 프롬프트, AI 응답, 로그가 들어 있으므로 커밋하지 않습니다.
+.harness/
+__pycache__/
+.venv/
