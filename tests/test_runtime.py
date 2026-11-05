@@ -175,8 +175,9 @@ class ZipappTests(unittest.TestCase):
     save = test_cli.HarnessTests.save
 
     def build(self, name="harness.pyz"):
-        output = self.root.parent / (self.root.name + "-dist") / name
-        self.addCleanup(lambda: output.unlink(missing_ok=True))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name).resolve() / "dist" / name
         load_builder().build(output)
         return output
 
@@ -184,7 +185,8 @@ class ZipappTests(unittest.TestCase):
         import zipfile
         first, second = self.build("a.pyz"), self.build("b.pyz")
         self.assertEqual(first.read_bytes(), second.read_bytes())
-        names = zipfile.ZipFile(first).namelist()
+        with zipfile.ZipFile(first) as archive:
+            names = archive.namelist()
         self.assertEqual(names[0], "__main__.py")
         self.assertEqual(sorted(names[1:]), sorted("harness/" + p.name for p in (REPO / "harness").glob("*.py")))
 

@@ -69,8 +69,9 @@ python3 -B -m harness --root "$PWD/projects/qqq-accumulator" run
      가상환경 심볼릭 링크는 풀지 않는다. agent·init이 쓰는 검증기는 `-I -S`로 실행해 `.pth`·sitecustomize가
      검증 결과를 위조하지 못한다(`-S`를 빼면 위조되는 것을 테스트로 확인). doctor에 `isolation`,
      `project.python` 항목을 추가했고, 실행 기록에 `interpreters`를 남긴다.
-  2. 설치·배포(REQ-DIST): pipx/uv tool 설치를 확인했고(Python 3.11 도구 환경 포함), 표준 라이브러리로
-     만드는 재현 가능한 단일 파일 `harness.pyz`(`tools/build_zipapp.py`)를 추가했다.
+  2. 설치·배포(REQ-DIST): `uv tool install .` 설치를 Python 3.11 도구 환경에서 확인했다(pipx는 같은
+     패키지 설치 방식이지만 이 세션에 없어 직접 실행하지 않았다). 표준 라이브러리로 만드는 재현 가능한 단일 파일
+     `harness.pyz`(`tools/build_zipapp.py`)를 추가했다.
   3. 정적 타입: `harness/`와 `tools/` 전체에 타입 힌트를 달고 mypy `--strict`가 Linux·Windows·macOS
      분기에서 모두 통과한다(pyright도 0건). mypy가 없는 PC에서도 `run`이 통과하도록 `harness.json` 검사에는
      넣지 않고, GitHub Actions(`.github/workflows/ci.yml`)가 3개 OS × Python 3.11·3.13 테스트와 타입 검사를 돌린다.

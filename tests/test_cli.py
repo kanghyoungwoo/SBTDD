@@ -14,7 +14,8 @@ class HarnessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Resolved like the CLI's --root: temporary folders can sit behind a symlink (macOS /var).
+        self.root = Path(self.temp.name).resolve()
         (self.root / "logic.py").write_text("VALUE = 2\n", encoding="utf-8")
         (self.root / "test_logic.py").write_text(
             "import unittest\nfrom logic import VALUE\n"

@@ -137,6 +137,9 @@ ctime은 사용자 프로세스가 되돌릴 수 없으므로 수정 시각을 �
 자료는 `.harness/incidents/`에 보존한다. 이 표시가 있는 동안 run, status, agent, init은 이력을
 사용하지 않고 오류로 끝난다. 사람이 영향받은 기록을 검토·복구 또는 격리한 뒤 표시를 지운다.
 AI 호출의 프롬프트·스키마·로그·응답은 프로젝트 밖 임시 폴더에서 받아 Harness가 증거 폴더로 복사한다.
+증거 쓰기는 경로의 모든 단계에서 심볼릭 링크를 거부하므로, 시스템 임시 폴더(macOS의 /var → /private/var,
+Windows의 8.3 짧은 이름)와 프로젝트 루트는 링크를 푼 실제 경로로 바꿔 쓴다. CLI의 `--root`와 run·status·agent·init·doctor
+함수의 root도 같은 방식으로 정규화한다.
 
 실행기가 호출하는 검증 CLI는 Harness 설치 위치(디렉터리 또는 `harness.pyz`)에서 Python `-I -S`로 실행한다.
 `-I`는 PYTHONPATH, 사용자 site-packages, 작업 디렉터리를 무시하므로 프로젝트의 `harness.py`,

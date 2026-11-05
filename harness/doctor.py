@@ -19,6 +19,7 @@ VERSION_SCRIPT = "import sys; print('.'.join(map(str, sys.version_info[:3])))"
 
 
 def run_doctor(root: Path, provider: str = 'all', python: str | None = None) -> JSON:
+    root = root.resolve()
     checks: list[JSON] = []
 
     def add(name: str, passed: bool, reason: str, action: str = '', **details: Any) -> None:

@@ -154,7 +154,7 @@ def run_init(root: Path, brief_path: Path, timeout_seconds: int = 300, implement
     require(review_model is None or is_text(review_model), "--review-model must be a model name")
     require(implement_model is None or implementer == "claude" and is_text(implement_model),
             "--implement-model needs --implementer claude; Codex uses its own configured model")
-    brief_path = brief_path.resolve()
+    root, brief_path = root.resolve(), brief_path.resolve()
     brief_bytes = brief_path.read_bytes()
     try:
         brief = brief_bytes.decode("utf-8-sig")

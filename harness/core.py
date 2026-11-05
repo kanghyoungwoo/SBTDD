@@ -200,6 +200,8 @@ def run_checks(root: Path, manifest: JSON, before: str, requirement: str | None 
     if requirement is not None:
         require(any(r["id"] == requirement for r in manifest["requirements"]),
                 f"Unknown requirement: {requirement}")
+    # Like the CLI, work on the resolved root: evidence writes refuse every symlink on their path.
+    root = root.resolve()
     with project_lock(root, "run"):
         return record_checks(root, manifest, before, requirement, python)
 
@@ -282,6 +284,7 @@ def read_record(path: Path) -> JSON:
 
 
 def project_status(root: Path, manifest: JSON, current: str) -> JSON:
+    root = root.resolve()
     try:
         check_integrity(root)
     except ValueError as error:

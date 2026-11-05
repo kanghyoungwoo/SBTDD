@@ -316,7 +316,9 @@ def guarded_invoke(root: Path, evidence_root: Path, invoke: Invoker, context: JS
         return state
 
     evidence_before = evidence_snapshot()
-    staging = Path(tempfile.gettempdir()) / ("harness-output-" + uuid.uuid4().hex)
+    # Resolved: the system temporary folder can sit behind a symlink (macOS /var -> /private/var),
+    # and artifact copying refuses to read or write through links.
+    staging = Path(tempfile.gettempdir()).resolve() / ("harness-output-" + uuid.uuid4().hex)
     staging.mkdir()
     changed: list[str] = []
     try:
@@ -407,6 +409,7 @@ def run_agent(root: Path, manifest: JSON, requirement: str | None = None, max_at
     require(type(timeout_seconds) is int and timeout_seconds > 0, "timeout-seconds must be a positive integer")
     require(requirement is None or any(r["id"] == requirement for r in manifest["requirements"]),
             f"Unknown requirement: {requirement}")
+    root = root.resolve()
     workflow = manifest["agent"].get("workflow", "codex")
     require(workflow in ("codex", "claude-codex", "claude"), "Unknown agent workflow")
     require(review_model is None or workflow != "codex" and is_text(review_model),

@@ -106,6 +106,26 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(agent.call_count, 2)
 
+    def test_artifacts_are_kept_when_the_temporary_folder_is_behind_a_symlink(self):
+        # macOS keeps the temporary folder under /var, a symlink to /private/var.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        real, link = Path(temporary.name).resolve() / 'real', Path(temporary.name).resolve() / 'link'
+        real.mkdir()
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except OSError:
+            self.skipTest('symlinks are not available')
+        def write(root, context, directory, timeout):
+            (directory / 'prompt.txt').write_text('prompt', encoding='utf-8')
+            return test_agent.response()
+        with patch('harness.agent.tempfile.gettempdir', return_value=str(link)):
+            result, _ = self.run_with(write)
+        self.assertEqual(result['reason'], 'no_progress')
+        session = (self.root / result['record']).parent
+        self.assertEqual((session / 'tests' / 'prompt.txt').read_text(encoding='utf-8'), 'prompt')
+        self.assertEqual(list(real.iterdir()), [])
+
     def test_project_module_does_not_replace_verifier(self):
         (self.root / 'harness.py').write_text(
             'print(\'{"schema_version": 1, "status": "valid", "fake": true}\')\n', encoding='utf-8')
@@ -471,7 +491,7 @@ class SnapshotTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.file = self.root / 'data.txt'
         self.file.write_text('aaaa', encoding='utf-8')
         cache = patch.dict(guard._digests, clear=True)

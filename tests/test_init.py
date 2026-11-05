@@ -39,7 +39,7 @@ class InitTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.base = Path(temporary.name)
+        self.base = Path(temporary.name).resolve()
         self.root = self.base / "project"
         self.root.mkdir()
         self.brief = self.base / "request.txt"

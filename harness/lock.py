@@ -112,7 +112,7 @@ def project_lock(root: Path, command: str) -> Iterator[str | None]:
     if key in _held:
         yield _held[key]
         return
-    evidence = root / ".harness"
+    evidence = key / ".harness"
     path, owner_path = evidence / LOCK_FILE, evidence / OWNER_FILE
     for item in (path, owner_path, owner_path.with_name(OWNER_FILE + ".tmp")):
         plain_path(item)
