@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 import zoneinfo
+from pathlib import Path
 from decimal import Decimal
 from typing import Callable
 
@@ -62,12 +64,42 @@ def load_config(path) -> Config:
 
 
 class Store:
-    def __init__(self, path) -> None:
+    _SCHEMA = (
+        """CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY,
+            trade_date TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            limit_price TEXT NOT NULL,
+            client_order_id TEXT,
+            broker_order_id TEXT,
+            fill_price TEXT,
+            fill_cost TEXT,
+            created_at TEXT,
+            UNIQUE (trade_date, rule_id)
+        ) STRICT""",
+    )
+
+    def __init__(self, path, conn: sqlite3.Connection | None = None) -> None:
         self.path = path
+        self._conn = conn
 
     @classmethod
     def open(cls, path) -> "Store":
-        raise NotImplementedError("Store.open")
+        if sqlite3.sqlite_version_info < (3, 37, 0):
+            raise RuntimeError("SQLite >= 3.37 is required for STRICT tables")
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(p), isolation_level=None)
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        if str(mode).lower() != "wal":
+            conn.close()
+            raise RuntimeError("could not enable WAL mode")
+        conn.execute("PRAGMA foreign_keys=ON")
+        for ddl in cls._SCHEMA:
+            conn.execute(ddl)
+        return cls(path, conn)
 
     def insert_order_intent(
         self,
@@ -77,10 +109,48 @@ class Store:
         limit_price: Decimal,
         status: str,
     ) -> int:
-        raise NotImplementedError("Store.insert_order_intent")
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO orders (trade_date, rule_id, status, quantity,"
+                " limit_price, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    trade_date.isoformat(),
+                    rule_id,
+                    status,
+                    str(quantity),
+                    str(limit_price),
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DuplicateOrderError(
+                f"order already exists for {trade_date.isoformat()}/{rule_id}"
+            ) from exc
+        return cur.lastrowid
 
     def list_orders(self) -> list[OrderRecord]:
-        raise NotImplementedError("Store.list_orders")
+        rows = self._conn.execute(
+            "SELECT trade_date, rule_id, status, quantity, limit_price,"
+            " broker_order_id, fill_price, fill_cost FROM orders"
+            " ORDER BY trade_date DESC, id DESC"
+        ).fetchall()
+
+        def dec(v):
+            return None if v is None else Decimal(v)
+
+        return [
+            OrderRecord(
+                trade_date=dt.date.fromisoformat(r[0]),
+                rule_id=r[1],
+                status=r[2],
+                quantity=Decimal(r[3]),
+                limit_price=Decimal(r[4]),
+                broker_order_id=r[5],
+                fill_price=dec(r[6]),
+                fill_cost=dec(r[7]),
+            )
+            for r in rows
+        ]
 
     def holdings(self) -> Decimal:
         raise NotImplementedError("Store.holdings")
@@ -94,7 +164,9 @@ class Store:
         raise NotImplementedError("Store.snapshot_sha256")
 
     def close(self) -> None:
-        raise NotImplementedError("Store.close")
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
 
 def import_csv(store: Store, path) -> ImportResult:
