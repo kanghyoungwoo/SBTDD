@@ -1,0 +1,42 @@
+name: ci
+
+# Tests on every OS the lock and process code branches for, plus the dev-only type check.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and acceptance tests
+        run: python -B -m unittest discover -s tests -v
+      - name: Harness verifies its own contract
+        run: python -B -m harness run
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install "mypy==2.3.1"
+      - name: mypy --strict for each platform branch
+        run: |
+          python -m mypy --platform linux
+          python -m mypy --platform win32
+          python -m mypy --platform darwin
