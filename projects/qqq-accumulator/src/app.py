@@ -951,7 +951,43 @@ def compute_order(
     buy_fee_pct: Decimal,
     fractional: bool,
 ) -> OrderPlan:
-    raise NotImplementedError("compute_order")
+    from decimal import ROUND_DOWN, ROUND_HALF_UP
+
+    hundred = Decimal(100)
+    one = Decimal(1)
+    limit_price = (prev_close * (one + limit_margin_pct / hundred)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    candidates = [
+        ("RULE", rule_amount),
+        ("CASH", orderable_cash),
+        ("PER_ORDER_LIMIT", per_order_limit),
+        ("MONTHLY_LIMIT", monthly_remaining),
+    ]
+    binding, amount = candidates[0]
+    for name, value in candidates[1:]:
+        if value < amount:
+            binding, amount = name, value
+    if amount < 0:
+        amount = Decimal(0)
+    unit = limit_price * (one + buy_fee_pct / hundred)
+    raw = amount / unit if unit > 0 else Decimal(0)
+    quantity = raw.quantize(
+        Decimal("0.000001") if fractional else Decimal("1"), rounding=ROUND_DOWN
+    )
+    if quantity > 0:
+        reason = None
+    elif binding == "MONTHLY_LIMIT":
+        reason = "MONTHLY_LIMIT_REACHED"
+    else:
+        reason = "INSUFFICIENT_CASH"
+    return OrderPlan(
+        limit_price=limit_price,
+        quantity=quantity,
+        amount=amount,
+        binding=binding,
+        reason=reason,
+    )
 
 
 def is_in_order_window(
